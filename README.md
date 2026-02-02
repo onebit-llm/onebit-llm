@@ -17,6 +17,32 @@ We are sharing this early to iterate in the open and to invite feedback from any
 
 ---
 
+## Repository structure
+
+```
+onebit-llm/
+├── Cargo.toml
+├── Cargo.lock
+├── config.json              # Default model config (created if missing)
+├── config.bitnet.json       # BitNet-style config (ternary, RoPE, ReLU², subln, Arenas)
+├── README.md
+├── docs/
+│   └── REFERENCE.md         # Framework / paper reference
+├── src/
+│   ├── lib.rs
+│   ├── config.rs
+│   ├── binary.rs
+│   ├── model.rs
+│   ├── data.rs
+│   └── bin/
+│       ├── train.rs
+│       ├── export.rs
+│       └── run.rs
+├── data/                    # Ignored; add tokenizer and datasets here
+├── checkpoints/             # Ignored; training output (safetensors, config)
+└── exported/                # Ignored; export output
+```
+
 ## Features
 
 - **Architecture**: Decoder-only transformer (GPT-style) with binary linear layers in attention and FFN.
@@ -60,6 +86,8 @@ cargo run --bin train -- \
 
 Checkpoints are written to `--output-dir` as `checkpoint-N.safetensors` and `config.json`; the final run saves `model.safetensors` and `config.json`.
 
+**If loss plateaus (e.g. never drops below ~5):** Academic work on 1-bit/ternary LLMs (BitNet b1.58, “BitNet b1.58 reloaded”, low-bit quantization surveys) finds that 1-bit training is *more robust to higher learning rates* than FP16; BitNet recipes often use a *higher* peak LR. The default `--lr` is now `1e-3`. If loss still plateaus, try `--lr 3e-3` or `--lr 1e-2` (with warmup and decay). Gradient clipping (default 1.0) keeps training stable.
+
 ### 2. Export
 
 Bundle a checkpoint for distribution: copy weights and config (and optionally the tokenizer) into an output directory.
@@ -99,15 +127,15 @@ For a short, reproducible run (no large download):
 3. **Train** (finishes in minutes; use `--max-steps` so it stops):
    ```bash
    cargo run --release --bin train -- \
-     --config config.json \
+     --config config.bitnet.json \
      --data-dir ./data/wikitext \
      --tokenizer ./data/superior-reasoning/tokenizer.json \
      --output-dir ./checkpoints \
-     --batch-size 16 \
+     --batch-size 8 \
      --max-steps 5000 \
      --save-every 1000
    ```
-4. **GPU / batch size** — Check usage with `nvidia-smi`. RTX 4080 Super (16 GB) can usually handle `--batch-size 16` or `32` with the default small model; increase until you see OOM, then back off.
+4. **GPU / batch size** — Check usage with `nvidia-smi`. Use `--batch-size 8` by default; increase (e.g. 16) if GPU has headroom, or reduce if OOM.
 
 ## Using Alibaba Superior-Reasoning-SFT for testing
 
@@ -136,19 +164,23 @@ For a quick test with a small subset, take the first N lines of the JSONL file i
 
 `OneBitLlmConfig` (JSON) includes:
 
-- `vocab_size`, `hidden_size`, `num_heads`, `num_layers`, `intermediate_size`, `max_seq_len`, `layer_norm_eps`
+- **Core:** `vocab_size`, `hidden_size`, `num_heads`, `num_layers`, `intermediate_size`, `max_seq_len`, `layer_norm_eps`
+- **BitNet-style (for lower loss):** `use_ternary` (ternary weights {-1,0,+1} with AbsMean), `use_relu2` (ReLU² in FFN), `use_subln` (RMSNorm instead of LayerNorm), `use_rope` (rotary position embeddings), `arenas_initial` and `arenas_anneal_steps` (full-precision residual path that anneals to 0).
+
+**For lower loss**, use a config with BitNet-style options enabled (e.g. `config.bitnet.json` or set `use_ternary`, `use_relu2`, `use_subln`, `use_rope` to `true` and `arenas_initial` to a value like `0.1`). Defaults in code are conservative; the example `config.bitnet.json` enables all of these. Training uses full-precision activations; 8-bit activation quantization (W1.58A8) in the doc is for inference only.
 
 Default values are in `src/config.rs`. `vocab_size` must match the tokenizer.
 
 ## Project layout
 
+- `docs/REFERENCE.md` — Framework / paper reference (1.58-bit paradigm, BitNet, Sherry, Arenas).
 - `src/config.rs` — Model config and JSON save/load.
-- `src/binary.rs` — Binary linear layer with STE.
+- `src/binary.rs` — Binary and ternary linear layers with STE.
 - `src/model.rs` — Decoder-only transformer (embedding, causal attention, decoder blocks, lm_head).
 - `src/data.rs` — Text dataset, tokenization, batching.
 - `src/bin/train.rs` — Training CLI.
 - `src/bin/export.rs` — Export CLI.
-- `src/bin/run.rs` — Import + inference CLI.
+- `src/bin/run.rs` — Import and inference CLI.
 
 ## Organization
 

@@ -3,7 +3,7 @@
 
 use candle::{DType, IndexOp, Result, Tensor, D};
 use candle_nn::{
-    embedding, layer_norm, linear_no_bias, rms_norm, Embedding, LayerNorm, Module, RmsNorm,
+    embedding, layer_norm_no_bias, linear_no_bias, rms_norm, Embedding, LayerNorm, Module, RmsNorm,
     VarBuilder,
 };
 
@@ -167,7 +167,7 @@ impl NormLayer {
                 vb,
             )?))
         } else {
-            Ok(NormLayer::LayerNorm(layer_norm(
+            Ok(NormLayer::LayerNorm(layer_norm_no_bias(
                 config.hidden_size,
                 config.layer_norm_eps,
                 vb,
@@ -214,7 +214,13 @@ impl DecoderBlock {
         let residual = &x;
         let x = self.ln2.forward(&x)?;
         let x = self.ff.forward(&x)?;
-        x + residual
+        let mut x = (x + residual)?;
+        if let Some(c) = arenas_coef {
+            let device = block_input.device();
+            let c_t = Tensor::new(&[c], device)?;
+            x = (x + block_input.broadcast_mul(&c_t)?)?;
+        }
+        Ok(x)
     }
 }
 

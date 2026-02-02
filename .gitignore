@@ -1,16 +1,17 @@
-# Rust / Cargo
+# Build
 /target/
 **/*.rs.bk
 
-# Checkpoints & exports (large binaries)
+# Checkpoints and exports (large binaries)
 /checkpoints/
+/exported/
 *.safetensors
 
-# Training / run artifacts
+# Training and run artifacts
 progress.txt
 *.log
 
-# Data (large datasets; keep structure if needed)
+# Data (large datasets; add tokenizer or small samples if needed)
 /data/
 
 # Environment
@@ -18,7 +19,7 @@ progress.txt
 .env.*
 !.env.example
 
-# IDE & editors
+# IDE and editors
 .idea/
 .vscode/
 *.swp
@@ -29,5 +30,5 @@ progress.txt
 .DS_Store
 Thumbs.db
 
-# Cursor (optional)
+# Optional: Cursor project files
 .cursor/

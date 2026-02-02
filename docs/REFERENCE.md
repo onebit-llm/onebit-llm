@@ -139,4 +139,3 @@ The emergence of 1-bit LLMs has the transformative potential to democratize AI b
 * Expansion of computational kernel support to NPUs and GPUs to enable acceleration on a wider range of hardware.  
 * Integration with advanced activation and KV-cache quantization schemes to further reduce the dynamic memory footprint during inference.  
 * Exploration of sub-1-bit models, such as those employing the  **Structured Binary Large Language Model (STBLLM)**  framework, to push the boundaries of computational efficiency even further.
-

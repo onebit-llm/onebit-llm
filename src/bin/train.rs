@@ -11,6 +11,37 @@ use clap::Parser;
 
 use onebit_llm::{batch_to_tensors, OneBitLlm, OneBitLlmConfig, StreamingBatchIter, TextDataset};
 
+/// Effective learning rate: warmup then constant or decay (cosine/linear) when max_steps > 0.
+fn effective_lr(
+    step: usize,
+    lr: f64,
+    lr_min: f64,
+    warmup_steps: usize,
+    max_steps: usize,
+    lr_decay: &str,
+) -> f64 {
+    if warmup_steps > 0 && step < warmup_steps {
+        return lr * (step as f64 + 1.0) / warmup_steps as f64;
+    }
+    if max_steps == 0 || lr_decay == "none" {
+        return lr;
+    }
+    let step = step.min(max_steps);
+    if step <= warmup_steps {
+        return lr;
+    }
+    let decay_steps = (max_steps - warmup_steps).max(1);
+    let progress = (step - warmup_steps) as f64 / decay_steps as f64;
+    match lr_decay {
+        "cosine" => {
+            let cos = (std::f64::consts::PI * progress).cos();
+            lr_min + 0.5 * (lr - lr_min) * (1.0 + cos)
+        }
+        "linear" => lr - (lr - lr_min) * progress,
+        _ => lr,
+    }
+}
+
 /// Clip gradient norm to max_norm; scale all grads so global L2 norm <= max_norm.
 fn clip_grad_norm(grads: &mut GradStore, vars: &[Var], max_norm: f64) -> anyhow::Result<()> {
     let mut total_norm_sq = 0.0f64;
@@ -66,8 +97,8 @@ struct Args {
     #[arg(long, default_value = "1000")]
     save_every: usize,
 
-    /// Learning rate. Use lower values (e.g. 1e-4 or 3e-5) for 1-bit/ternary stability.
-    #[arg(long, default_value = "1e-4")]
+    /// Learning rate. 1-bit/ternary training often benefits from higher LR than FP16 (e.g. 1e-3 or 3e-3); try raising if loss plateaus (BitNet literature).
+    #[arg(long, default_value = "1e-3")]
     lr: f64,
 
     /// Gradient clipping: max L2 norm of gradients (0 = disabled). Use 1.0 for 1-bit/ternary.
@@ -77,6 +108,14 @@ struct Args {
     /// LR warmup steps: linear warmup from 0 to lr over this many steps (0 = no warmup).
     #[arg(long, default_value = "1000")]
     lr_warmup_steps: usize,
+
+    /// Minimum LR for decay (used only when lr_decay is cosine or linear and max_steps > 0).
+    #[arg(long, default_value = "1e-5")]
+    lr_min: f64,
+
+    /// LR decay after warmup: cosine, linear, or none. Only applies when max_steps > 0.
+    #[arg(long, default_value = "cosine", value_parser = ["cosine", "linear", "none"])]
+    lr_decay: String,
 
     /// Log loss every N steps (higher = smaller log file; 0 = only progress lines).
     #[arg(long, default_value = "100")]
@@ -104,8 +143,8 @@ fn main() -> anyhow::Result<()> {
 
     let vars = varmap.all_vars();
     eprintln!(
-        "Training: lr={}, grad_clip_max_norm={}, lr_warmup_steps={}",
-        args.lr, args.grad_clip_max_norm, args.lr_warmup_steps
+        "Training: lr={}, lr_min={}, lr_decay={}, grad_clip_max_norm={}, lr_warmup_steps={}",
+        args.lr, args.lr_min, args.lr_decay, args.grad_clip_max_norm, args.lr_warmup_steps
     );
     let mut optimizer = AdamW::new(
         vars.clone(),
@@ -149,11 +188,14 @@ fn main() -> anyhow::Result<()> {
             let labels_flat = labels.reshape((b * t,))?.to_dtype(DType::U32)?;
             let loss = loss::cross_entropy(&logits_flat, &labels_flat)?;
 
-            let effective_lr = if args.lr_warmup_steps > 0 && global_step < args.lr_warmup_steps {
-                args.lr * (global_step as f64 + 1.0) / args.lr_warmup_steps as f64
-            } else {
-                args.lr
-            };
+            let effective_lr = effective_lr(
+                global_step,
+                args.lr,
+                args.lr_min,
+                args.lr_warmup_steps,
+                args.max_steps,
+                &args.lr_decay,
+            );
             optimizer.set_learning_rate(effective_lr);
 
             let mut grads = loss.backward()?;
@@ -235,11 +277,14 @@ fn main() -> anyhow::Result<()> {
         let labels_flat = labels.reshape((b * t,))?.to_dtype(DType::U32)?;
         let loss = loss::cross_entropy(&logits_flat, &labels_flat)?;
 
-        let effective_lr = if args.lr_warmup_steps > 0 && global_step < args.lr_warmup_steps {
-            args.lr * (global_step as f64 + 1.0) / args.lr_warmup_steps as f64
-        } else {
-            args.lr
-        };
+        let effective_lr = effective_lr(
+            global_step,
+            args.lr,
+            args.lr_min,
+            args.lr_warmup_steps,
+            args.max_steps,
+            &args.lr_decay,
+        );
         optimizer.set_learning_rate(effective_lr);
 
         let mut grads = loss.backward()?;

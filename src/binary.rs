@@ -4,7 +4,7 @@
 //! flow to full-precision parameters via STE. Supports binary ±1 and ternary {-1,0,+1} (AbsMean).
 
 use candle::{Result, Tensor};
-use candle_nn::{linear_no_bias, Linear, Module, VarBuilder};
+use candle_nn::{Init, Linear, Module, VarBuilder};
 
 /// Straight-through estimator for sign: forward = sign(x), backward = identity.
 #[inline]
@@ -34,17 +34,27 @@ pub struct BinaryLinear {
     weight: Linear,
 }
 
+/// Small init for 1-bit layers so more weights land in zero band (ternary) or don't all saturate (binary).
+const BIT_LAYER_INIT: Init = Init::Randn {
+    mean: 0.,
+    stdev: 0.02,
+};
+
 impl BinaryLinear {
     pub fn new(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
-        let weight = linear_no_bias(in_dim, out_dim, vb)?;
+        let ws = vb.get_with_hints((out_dim, in_dim), "weight", BIT_LAYER_INIT)?;
+        let weight = Linear::new(ws, None);
         Ok(Self { weight })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let w = self.weight.weight();
+        let in_dim = w.dim(1)?;
         let w_bin = ste_sign(w)?;
         let x_bin = ste_sign(x)?;
-        matmul_reshape(&x_bin, &w_bin.t()?)
+        let out = matmul_reshape(&x_bin, &w_bin.t()?)?;
+        let scale = 1.0 / (in_dim as f64).sqrt();
+        out.affine(scale, 0.0)
     }
 }
 
@@ -61,15 +71,19 @@ pub struct TernaryLinear {
 
 impl TernaryLinear {
     pub fn new(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
-        let weight = linear_no_bias(in_dim, out_dim, vb)?;
+        let ws = vb.get_with_hints((out_dim, in_dim), "weight", BIT_LAYER_INIT)?;
+        let weight = Linear::new(ws, None);
         Ok(Self { weight })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let w = self.weight.weight();
+        let in_dim = w.dim(1)?;
         let w_ternary = ternary_absmean_ste(w)?;
         // Activations: full-precision in training; optional 8-bit AbsMax for inference later.
-        matmul_reshape(x, &w_ternary.t()?)
+        let out = matmul_reshape(x, &w_ternary.t()?)?;
+        let scale = 1.0 / (in_dim as f64).sqrt();
+        out.affine(scale, 0.0)
     }
 }
 
