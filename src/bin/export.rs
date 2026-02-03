@@ -75,5 +75,6 @@ fn main() -> anyhow::Result<()> {
     }
 
     eprintln!("Export done. Output: {}", args.output_dir.display());
+    eprintln!("Tip: for faster inference without re-quantizing each forward, use: run --model-dir {} --use-cached-quantized", args.output_dir.display());
     Ok(())
 }

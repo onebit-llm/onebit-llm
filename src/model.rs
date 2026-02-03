@@ -17,11 +17,24 @@ enum BitLinearLayer {
 }
 
 impl BitLinearLayer {
-    fn new(in_dim: usize, out_dim: usize, use_ternary: bool, vb: VarBuilder) -> Result<Self> {
-        if use_ternary {
-            Ok(BitLinearLayer::Ternary(TernaryLinear::new(in_dim, out_dim, vb)?))
+    fn new(in_dim: usize, out_dim: usize, config: &OneBitLlmConfig, vb: VarBuilder) -> Result<Self> {
+        if config.use_ternary {
+            Ok(BitLinearLayer::Ternary(TernaryLinear::new(
+                in_dim,
+                out_dim,
+                vb,
+                config.use_dynamic_threshold,
+                config.ste_scale_factor,
+                config.latent_clamp_max,
+            )?))
         } else {
-            Ok(BitLinearLayer::Binary(BinaryLinear::new(in_dim, out_dim, vb)?))
+            Ok(BitLinearLayer::Binary(BinaryLinear::new(
+                in_dim,
+                out_dim,
+                vb,
+                config.ste_scale_factor,
+                config.latent_clamp_max,
+            )?))
         }
     }
 
@@ -29,6 +42,34 @@ impl BitLinearLayer {
         match self {
             BitLinearLayer::Binary(l) => l.forward(x),
             BitLinearLayer::Ternary(l) => l.forward(x),
+        }
+    }
+
+    /// Debug: -1, 0, +1 (ternary) or -1, +1 (binary) distribution as string.
+    fn debug_weight_distribution(&self) -> Result<String> {
+        match self {
+            BitLinearLayer::Binary(l) => {
+                let (n_neg, n_pos) = l.debug_weight_distribution()?;
+                Ok(format!("binary -1:{} +1:{}", n_neg, n_pos))
+            }
+            BitLinearLayer::Ternary(l) => {
+                let (n_neg, n_zero, n_pos) = l.debug_weight_distribution()?;
+                Ok(format!("ternary -1:{} 0:{} +1:{}", n_neg, n_zero, n_pos))
+            }
+        }
+    }
+
+    fn cache_quantized(&self) -> Result<()> {
+        match self {
+            BitLinearLayer::Binary(l) => l.cache_quantized(),
+            BitLinearLayer::Ternary(l) => l.cache_quantized(),
+        }
+    }
+
+    fn clear_cache(&self) {
+        match self {
+            BitLinearLayer::Binary(l) => l.clear_cache(),
+            BitLinearLayer::Ternary(l) => l.clear_cache(),
         }
     }
 }
@@ -66,8 +107,8 @@ impl CausalSelfAttention {
         let hidden = config.hidden_size;
         let num_heads = config.num_heads;
         let head_dim = config.head_dim();
-        let c_attn = BitLinearLayer::new(hidden, 3 * hidden, config.use_ternary, vb.pp("c_attn"))?;
-        let c_proj = BitLinearLayer::new(hidden, hidden, config.use_ternary, vb.pp("c_proj"))?;
+        let c_attn = BitLinearLayer::new(hidden, 3 * hidden, config, vb.pp("c_attn"))?;
+        let c_proj = BitLinearLayer::new(hidden, hidden, config, vb.pp("c_proj"))?;
         let (q_norm, k_norm) = if config.use_qk_norm {
             let q = rms_norm(head_dim, config.layer_norm_eps, vb.pp("q_norm"))?;
             let k = rms_norm(head_dim, config.layer_norm_eps, vb.pp("k_norm"))?;
@@ -122,6 +163,30 @@ impl CausalSelfAttention {
         let y = y.reshape((b, t, c))?;
         self.c_proj.forward(&y)
     }
+
+    fn debug_weight_distributions(&self, prefix: &str) -> Vec<(String, Result<String>)> {
+        vec![
+            (
+                format!("{}.c_attn", prefix),
+                self.c_attn.debug_weight_distribution(),
+            ),
+            (
+                format!("{}.c_proj", prefix),
+                self.c_proj.debug_weight_distribution(),
+            ),
+        ]
+    }
+
+    fn cache_quantized(&self) -> Result<()> {
+        self.c_attn.cache_quantized()?;
+        self.c_proj.cache_quantized()?;
+        Ok(())
+    }
+
+    fn clear_cache(&self) {
+        self.c_attn.clear_cache();
+        self.c_proj.clear_cache();
+    }
 }
 
 /// ReLU²: squared ReLU (BitNet-style activation).
@@ -139,18 +204,8 @@ struct FeedForward {
 
 impl FeedForward {
     fn new(config: &OneBitLlmConfig, vb: VarBuilder) -> Result<Self> {
-        let c_fc = BitLinearLayer::new(
-            config.hidden_size,
-            config.intermediate_size,
-            config.use_ternary,
-            vb.pp("c_fc"),
-        )?;
-        let c_proj = BitLinearLayer::new(
-            config.intermediate_size,
-            config.hidden_size,
-            config.use_ternary,
-            vb.pp("c_proj"),
-        )?;
+        let c_fc = BitLinearLayer::new(config.hidden_size, config.intermediate_size, config, vb.pp("c_fc"))?;
+        let c_proj = BitLinearLayer::new(config.intermediate_size, config.hidden_size, config, vb.pp("c_proj"))?;
         Ok(Self {
             c_fc,
             c_proj,
@@ -166,6 +221,30 @@ impl FeedForward {
             candle_nn::ops::silu(&x)?
         };
         self.c_proj.forward(&x)
+    }
+
+    fn debug_weight_distributions(&self, prefix: &str) -> Vec<(String, Result<String>)> {
+        vec![
+            (
+                format!("{}.c_fc", prefix),
+                self.c_fc.debug_weight_distribution(),
+            ),
+            (
+                format!("{}.c_proj", prefix),
+                self.c_proj.debug_weight_distribution(),
+            ),
+        ]
+    }
+
+    fn cache_quantized(&self) -> Result<()> {
+        self.c_fc.cache_quantized()?;
+        self.c_proj.cache_quantized()?;
+        Ok(())
+    }
+
+    fn clear_cache(&self) {
+        self.c_fc.clear_cache();
+        self.c_proj.clear_cache();
     }
 }
 
@@ -253,6 +332,24 @@ impl DecoderBlock {
         }
         Ok(x)
     }
+
+    fn debug_weight_distributions(&self, block_idx: usize) -> Vec<(String, Result<String>)> {
+        let prefix = format!("h.{}", block_idx);
+        let mut out = self.attn.debug_weight_distributions(&format!("{}.attn", prefix));
+        out.extend(self.ff.debug_weight_distributions(&format!("{}.mlp", prefix)));
+        out
+    }
+
+    fn cache_quantized(&self) -> Result<()> {
+        self.attn.cache_quantized()?;
+        self.ff.cache_quantized()?;
+        Ok(())
+    }
+
+    fn clear_cache(&self) {
+        self.attn.clear_cache();
+        self.ff.clear_cache();
+    }
 }
 
 /// OneBit-LLM: decoder-only transformer with binary/ternary attention and FFN; optional RoPE, ReLU², subln, Arenas.
@@ -304,5 +401,76 @@ impl OneBitLlm {
 
     pub fn config(&self) -> &OneBitLlmConfig {
         &self.config
+    }
+
+    /// Debug: collect -1, 0, +1 (or -1, +1) weight distribution for all bit-linear layers.
+    pub fn debug_weight_distributions(&self) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        for (i, block) in self.blocks.iter().enumerate() {
+            for (name, res) in block.debug_weight_distributions(i) {
+                let s = res?;
+                out.push((name, s));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Pre-compute quantized weights for all bit-linear layers (inference-only). Forward will skip re-quantize.
+    pub fn cache_quantized_weights(&self) -> Result<()> {
+        for block in &self.blocks {
+            block.cache_quantized()?;
+        }
+        Ok(())
+    }
+
+    /// Clear cached quantized weights (e.g. before training).
+    pub fn clear_quantized_cache(&self) {
+        for block in &self.blocks {
+            block.clear_cache();
+        }
+    }
+}
+
+/// Compression stats: total and quantized parameter counts from config (for logging).
+#[derive(Debug, Clone)]
+pub struct CompressionStats {
+    pub total_params: usize,
+    pub quantized_params: usize,
+    /// Effective bits per weight: (quantized * 2 + (total - quantized) * 32) / total (ternary ≈ 2 bit).
+    pub effective_bits_per_param: f64,
+    /// Compression ratio vs full F32 (32 bit).
+    pub compression_ratio_vs_f32: f64,
+}
+
+impl OneBitLlmConfig {
+    /// Approximate parameter counts and compression stats from config (no model needed).
+    pub fn compression_stats(&self) -> CompressionStats {
+        let vocab = self.vocab_size;
+        let h = self.hidden_size;
+        let n = self.num_layers;
+        let i = self.intermediate_size;
+
+        let wte = vocab * h;
+        let lm_head = h * vocab;
+        let per_block_attn = h * (3 * h) + h * h;
+        let per_block_ff = h * i + i * h;
+        let quantized_per_block = per_block_attn + per_block_ff;
+
+        let norm_params = (n * 2 + 1) * h; // ln1, ln2 per block + ln_f; approx
+        let qk_norm = if self.use_qk_norm { n * 2 * h } else { 0 };
+        let total = wte + lm_head + n * (per_block_attn + per_block_ff + norm_params) + qk_norm;
+        let quantized = n * quantized_per_block;
+
+        let bits_quantized = 2.0; // ternary
+        let bits_full = 32.0;
+        let effective_bits = (quantized as f64 * bits_quantized + (total.saturating_sub(quantized)) as f64 * bits_full) / total.max(1) as f64;
+        let compression_ratio_vs_f32 = bits_full / effective_bits;
+
+        CompressionStats {
+            total_params: total,
+            quantized_params: quantized,
+            effective_bits_per_param: effective_bits,
+            compression_ratio_vs_f32,
+        }
     }
 }

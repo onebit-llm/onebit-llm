@@ -42,6 +42,15 @@ pub struct OneBitLlmConfig {
     /// Residual scaling: scale sublayer output by 1/sqrt(2) before adding to residual. Improves gradient flow in deep 1-bit nets.
     #[serde(default = "default_true")]
     pub use_residual_scaling: bool,
+    /// Dynamic threshold for ternary: Δ = 0.7 × mean(|W|) in original space; |w| <= Δ -> 0, else sign(w). Makes weights flip more easily.
+    #[serde(default = "default_true")]
+    pub use_dynamic_threshold: bool,
+    /// STE scale factor: gradient flowing to latent weights is multiplied by this (>1 strengthens updates so ternary counts can change). Default 2.0.
+    #[serde(default = "default_ste_scale")]
+    pub ste_scale_factor: f64,
+    /// Latent weight clamp: in forward, clamp latent weights to [-latent_clamp_max, +latent_clamp_max] so they stay near threshold. Default 1.5.
+    #[serde(default = "default_latent_clamp_max")]
+    pub latent_clamp_max: f64,
     /// Arenas: initial coefficient for full-precision residual path (None = disabled). Anneals to 0 over arenas_anneal_steps.
     #[serde(default)]
     pub arenas_initial: Option<f64>,
@@ -56,6 +65,14 @@ fn default_arenas_anneal_steps() -> usize {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_ste_scale() -> f64 {
+    2.0
+}
+
+fn default_latent_clamp_max() -> f64 {
+    1.5
 }
 
 fn default_layer_norm_eps() -> f64 {
@@ -78,6 +95,9 @@ impl Default for OneBitLlmConfig {
             use_rope: false,
             use_qk_norm: true,
             use_residual_scaling: true,
+            use_dynamic_threshold: true,
+            ste_scale_factor: 2.0,
+            latent_clamp_max: 1.5,
             arenas_initial: None,
             arenas_anneal_steps: 10_000,
         }

@@ -12,6 +12,9 @@
   "use_rope": true,
   "use_qk_norm": true,
   "use_residual_scaling": true,
+  "use_dynamic_threshold": true,
+  "ste_scale_factor": 2.0,
+  "latent_clamp_max": 1.5,
   "arenas_initial": 0.1,
   "arenas_anneal_steps": 10000
 }

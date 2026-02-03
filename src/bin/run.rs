@@ -23,7 +23,7 @@ fn sample_next_token(logits: &candle::Tensor, temperature: f64) -> anyhow::Resul
 }
 use tokenizers::Tokenizer;
 
-use onebit_llm::{OneBitLlm, OneBitLlmConfig};
+use onebit_llm::{batch_to_tensors, OneBitLlm, OneBitLlmConfig, TextDataset};
 
 #[derive(Parser, Debug)]
 #[command(name = "run", about = "Load model and run inference")]
@@ -51,6 +51,18 @@ struct Args {
     /// Sampling temperature (0 = greedy, 0.7–1.0 = more diverse; reduces repetition).
     #[arg(long, default_value = "0.8")]
     temperature: f64,
+
+    /// Pre-compute and cache quantized weights once for faster repeated forwards (inference-only).
+    #[arg(long)]
+    use_cached_quantized: bool,
+
+    /// Run N forward passes and report throughput (tokens/sec or time per forward). 0 = disabled.
+    #[arg(long, default_value = "0")]
+    benchmark: usize,
+
+    /// Evaluate perplexity on a text file (one sentence per line). Requires --tokenizer. Disables chat/prompt.
+    #[arg(long)]
+    eval_perplexity: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -96,10 +108,77 @@ fn main() -> anyhow::Result<()> {
 
     eprintln!("Loaded model from {}", args.model_dir.display());
 
+    if args.use_cached_quantized {
+        model.cache_quantized_weights().context("cache quantized weights")?;
+        eprintln!("Cached quantized weights for inference.");
+    }
+
     let tokenizer_path = args
         .tokenizer
         .clone()
         .unwrap_or_else(|| args.model_dir.join("tokenizer.json"));
+
+    if let Some(eval_path) = &args.eval_perplexity {
+        if !tokenizer_path.exists() {
+            anyhow::bail!(
+                "eval-perplexity requires tokenizer at {} (use --tokenizer or copy tokenizer.json)",
+                tokenizer_path.display()
+            );
+        }
+        let _tokenizer = Tokenizer::from_file(tokenizer_path.as_os_str().to_string_lossy().into_owned())
+            .map_err(|e| anyhow::anyhow!("load tokenizer: {}", e))?;
+        let mut dataset = TextDataset::new(eval_path, &tokenizer_path, config.max_seq_len)
+            .context("create eval dataset")?;
+        dataset.load()?;
+        let batch_size = 8usize;
+        let seq_len = config.max_seq_len;
+        let mut loss_sum = 0.0f64;
+        let mut count = 0usize;
+        for (input_ids, labels) in dataset.batches(batch_size).take(500) {
+            let (input_ids, labels) = batch_to_tensors(&input_ids, &labels, batch_size, seq_len, &device)?;
+            let logits = model.forward(&input_ids)?;
+            let (b, t, v) = logits.dims3()?;
+            let logits_flat = logits.reshape((b * t, v))?;
+            let labels_flat = labels.reshape((b * t,))?.to_dtype(DType::U32)?;
+            let loss = candle_nn::loss::cross_entropy(&logits_flat, &labels_flat)?;
+            loss_sum += loss.to_scalar::<f32>()? as f64;
+            count += 1;
+        }
+        if count > 0 {
+            let avg_loss = loss_sum / count as f64;
+            let ppl = avg_loss.exp();
+            eprintln!("Eval perplexity: loss={:.4} perplexity={:.2} ({} batches)", avg_loss, ppl, count);
+        } else {
+            eprintln!("No batches for eval.");
+        }
+        return Ok(());
+    }
+
+    if args.benchmark > 0 {
+        let batch_size = 1usize;
+        let seq_len = config.max_seq_len.min(128);
+        let dummy_ids = vec![0u32; batch_size * seq_len];
+        let input = candle::Tensor::from_vec(dummy_ids.clone(), (batch_size, seq_len), &device)?;
+        let warmup = 3;
+        for _ in 0..warmup {
+            let _ = model.forward(&input)?;
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..args.benchmark {
+            let input = candle::Tensor::from_vec(dummy_ids.clone(), (batch_size, seq_len), &device)?;
+            let _ = model.forward(&input)?;
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let throughput = args.benchmark as f64 / elapsed;
+        eprintln!(
+            "Benchmark: {} forwards in {:.2}s, {:.1} forwards/sec, {:.2} ms/forward",
+            args.benchmark,
+            elapsed,
+            throughput,
+            1000.0 / throughput
+        );
+        return Ok(());
+    }
 
     if args.chat {
         if !tokenizer_path.exists() {

@@ -10,5 +10,5 @@ pub mod data;
 
 pub use config::OneBitLlmConfig;
 pub use binary::{BinaryLinear, TernaryLinear};
-pub use model::OneBitLlm;
+pub use model::{OneBitLlm, CompressionStats};
 pub use data::{batch_to_tensors, StreamingBatchIter, TextDataset};

@@ -30,35 +30,61 @@ fn cross_entropy_with_label_smoothing(
     nll.affine(1.0 - s, s / v * neg_sum_mean)
 }
 
-/// Effective learning rate: warmup then constant or decay (cosine/linear) when max_steps > 0.
-fn effective_lr(
+/// Learning rate schedule: warmup then constant or decay (cosine/linear) when max_steps > 0.
+#[derive(Clone)]
+struct LrScheduler {
     step: usize,
     lr: f64,
     lr_min: f64,
     warmup_steps: usize,
     max_steps: usize,
-    lr_decay: &str,
-) -> f64 {
-    if warmup_steps > 0 && step < warmup_steps {
-        return lr * (step as f64 + 1.0) / warmup_steps as f64;
+    lr_decay: String,
+}
+
+impl LrScheduler {
+    fn new(lr: f64, lr_min: f64, warmup_steps: usize, max_steps: usize, lr_decay: String) -> Self {
+        Self { step: 0, lr, lr_min, warmup_steps, max_steps, lr_decay }
     }
-    if max_steps == 0 || lr_decay == "none" {
-        return lr;
-    }
-    let step = step.min(max_steps);
-    if step <= warmup_steps {
-        return lr;
-    }
-    let decay_steps = (max_steps - warmup_steps).max(1);
-    let progress = (step - warmup_steps) as f64 / decay_steps as f64;
-    match lr_decay {
-        "cosine" => {
-            let cos = (std::f64::consts::PI * progress).cos();
-            lr_min + 0.5 * (lr - lr_min) * (1.0 + cos)
+
+    fn current_lr(&self) -> f64 {
+        let step = self.step;
+        if self.warmup_steps > 0 && step < self.warmup_steps {
+            return self.lr * (step as f64 + 1.0) / self.warmup_steps as f64;
         }
-        "linear" => lr - (lr - lr_min) * progress,
-        _ => lr,
+        if self.max_steps == 0 || self.lr_decay == "none" {
+            return self.lr;
+        }
+        let step = step.min(self.max_steps);
+        if step <= self.warmup_steps {
+            return self.lr;
+        }
+        let decay_steps = (self.max_steps - self.warmup_steps).max(1);
+        let progress = (step - self.warmup_steps) as f64 / decay_steps as f64;
+        match self.lr_decay.as_str() {
+            "cosine" => {
+                let cos = (std::f64::consts::PI * progress).cos();
+                self.lr_min + 0.5 * (self.lr - self.lr_min) * (1.0 + cos)
+            }
+            "linear" => self.lr - (self.lr - self.lr_min) * progress,
+            _ => self.lr,
+        }
     }
+
+    fn advance(&mut self) {
+        self.step += 1;
+    }
+}
+
+/// Total L2 norm of gradients (for debug logging).
+fn grad_norm(grads: &GradStore, vars: &[Var]) -> anyhow::Result<f64> {
+    let mut total_norm_sq = 0.0f64;
+    for var in vars.iter() {
+        if let Some(g) = grads.get(var.as_tensor()) {
+            let s = g.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
+            total_norm_sq += s;
+        }
+    }
+    Ok(total_norm_sq.sqrt().max(1e-12))
 }
 
 /// Clip gradient norm to max_norm; scale all grads so global L2 norm <= max_norm.
@@ -120,9 +146,13 @@ struct Args {
     #[arg(long, default_value = "1000")]
     save_every: usize,
 
-    /// Learning rate. 1-bit/ternary training often benefits from higher LR than FP16 (e.g. 1e-3 or 3e-3); try raising if loss plateaus (BitNet literature).
-    #[arg(long, default_value = "1e-3")]
+    /// Learning rate. 1-bit/ternary often needs higher LR (e.g. 5e-3 or 1e-2) so latent weights can cross the quantization threshold; default 5e-3.
+    #[arg(long, default_value = "5e-3")]
     lr: f64,
+
+    /// Weight decay (L2). Use 0 to avoid shrinking latent weights so they can flip -1/0/+1; non-zero may cause "frozen" ternary counts.
+    #[arg(long, default_value = "0.0")]
+    weight_decay: f64,
 
     /// Gradient clipping: max L2 norm of gradients (0 = disabled). Use 1.0 for 1-bit/ternary.
     #[arg(long, default_value = "1.0")]
@@ -147,6 +177,26 @@ struct Args {
     /// Log loss every N steps (higher = smaller log file; 0 = only progress lines).
     #[arg(long, default_value = "100")]
     log_every: usize,
+
+    /// Debug: every N steps print weight distribution (-1, 0, +1 counts) for all bit-linear layers and total gradient norm. 0 = disabled.
+    #[arg(long, default_value = "0")]
+    debug_every: usize,
+
+    /// Gradient accumulation steps: effective batch = batch_size * accumulation_steps. Use for large models when OOM.
+    #[arg(long, default_value = "1")]
+    accumulation_steps: usize,
+
+    /// Validation data path (file or dir). If set, validation perplexity is computed every eval_every steps.
+    #[arg(long)]
+    val_data_dir: Option<PathBuf>,
+
+    /// Run validation and log perplexity every N steps (requires --val-data-dir). 0 = disabled.
+    #[arg(long, default_value = "500")]
+    eval_every: usize,
+
+    /// Max validation batches per eval (0 = use all available val batches up to memory).
+    #[arg(long, default_value = "50")]
+    eval_batches: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -169,14 +219,30 @@ fn main() -> anyhow::Result<()> {
     let model = OneBitLlm::new(vb, &config)?;
 
     let vars = varmap.all_vars();
+    let compression = config.compression_stats();
     eprintln!(
-        "Training: lr={}, lr_min={}, lr_decay={}, grad_clip_max_norm={}, lr_warmup_steps={}",
-        args.lr, args.lr_min, args.lr_decay, args.grad_clip_max_norm, args.lr_warmup_steps
+        "Compression: total_params={} quantized_params={} effective_bits={:.2} compression_ratio={:.2}x",
+        compression.total_params,
+        compression.quantized_params,
+        compression.effective_bits_per_param,
+        compression.compression_ratio_vs_f32
+    );
+    eprintln!(
+        "Training: lr={}, lr_min={}, lr_decay={}, grad_clip_max_norm={}, lr_warmup_steps={}, accumulation_steps={}",
+        args.lr, args.lr_min, args.lr_decay, args.grad_clip_max_norm, args.lr_warmup_steps, args.accumulation_steps
+    );
+    let mut lr_scheduler = LrScheduler::new(
+        args.lr,
+        args.lr_min,
+        args.lr_warmup_steps,
+        args.max_steps,
+        args.lr_decay.clone(),
     );
     let mut optimizer = AdamW::new(
         vars.clone(),
         ParamsAdamW {
             lr: args.lr,
+            weight_decay: args.weight_decay,
             ..Default::default()
         },
     )?;
@@ -184,6 +250,15 @@ fn main() -> anyhow::Result<()> {
     let mut global_step = 0usize;
     let batch_size = args.batch_size;
     let seq_len = config.max_seq_len;
+
+    let val_dataset: Option<TextDataset> = if let Some(ref p) = args.val_data_dir {
+        let mut ds = TextDataset::new(p, &args.tokenizer, seq_len)?;
+        ds.load()?;
+        eprintln!("Validation: loaded {} sequences (eval_every={}, eval_batches={})", ds.num_sequences(), args.eval_every, args.eval_batches);
+        Some(ds)
+    } else {
+        None
+    };
 
     if args.streaming {
         eprintln!("Streaming mode: reading files line-by-line (stage1 + stage2)");
@@ -193,52 +268,98 @@ fn main() -> anyhow::Result<()> {
             seq_len,
             batch_size,
         )?;
-        while let Some((input_ids, labels)) = stream.next_batch()? {
+        loop {
             if args.max_steps > 0 && global_step >= args.max_steps {
                 break;
             }
-            let (input_ids, labels) = batch_to_tensors(
-                &input_ids,
-                &labels,
-                batch_size,
-                seq_len,
-                &device,
-            )?;
-
+            let mut batches = Vec::with_capacity(args.accumulation_steps);
+            for _ in 0..args.accumulation_steps {
+                match stream.next_batch()? {
+                    Some(b) => batches.push(b),
+                    None => break,
+                }
+            }
+            if batches.is_empty() {
+                break;
+            }
+            let n = batches.len();
             let arenas_coef = config.arenas_initial.map(|init| {
                 let progress = global_step as f64 / config.arenas_anneal_steps as f64;
                 (init * (1.0 - progress.min(1.0))) as f32
             });
-            let logits = model.forward_with_arenas(&input_ids, arenas_coef)?;
-            let (b, t, v) = logits.dims3()?;
-            let logits_flat = logits.reshape((b * t, v))?;
-            let labels_flat = labels.reshape((b * t,))?.to_dtype(DType::U32)?;
-            let loss = cross_entropy_with_label_smoothing(
-                &logits_flat,
-                &labels_flat,
-                args.label_smoothing,
-                config.vocab_size,
-            )?;
+            let mut total_loss = None;
+            let mut loss_sum = 0.0f32;
+            for (input_ids, labels) in batches {
+                let (input_ids, labels) = batch_to_tensors(
+                    &input_ids,
+                    &labels,
+                    batch_size,
+                    seq_len,
+                    &device,
+                )?;
+                let logits = model.forward_with_arenas(&input_ids, arenas_coef)?;
+                let (b, t, v) = logits.dims3()?;
+                let logits_flat = logits.reshape((b * t, v))?;
+                let labels_flat = labels.reshape((b * t,))?.to_dtype(DType::U32)?;
+                let loss = cross_entropy_with_label_smoothing(
+                    &logits_flat,
+                    &labels_flat,
+                    args.label_smoothing,
+                    config.vocab_size,
+                )?;
+                loss_sum += loss.to_scalar::<f32>()?;
+                let scaled = loss.affine(1.0 / n as f64, 0.0)?;
+                total_loss = Some(match total_loss {
+                    None => scaled,
+                    Some(prev) => (prev + scaled)?,
+                });
+            }
+            let total_loss = total_loss.unwrap();
+            let loss_val = loss_sum / n as f32;
 
-            let effective_lr = effective_lr(
-                global_step,
-                args.lr,
-                args.lr_min,
-                args.lr_warmup_steps,
-                args.max_steps,
-                &args.lr_decay,
-            );
-            optimizer.set_learning_rate(effective_lr);
-
-            let mut grads = loss.backward()?;
+            optimizer.set_learning_rate(lr_scheduler.current_lr());
+            let mut grads = total_loss.backward()?;
+            let debug_grad_norm = if args.debug_every > 0 && global_step % args.debug_every == 0 {
+                Some(grad_norm(&grads, &vars)?)
+            } else {
+                None
+            };
             if args.grad_clip_max_norm > 0.0 {
                 clip_grad_norm(&mut grads, &vars, args.grad_clip_max_norm)?;
             }
             optimizer.step(&grads)?;
-
-            let loss_val = loss.to_scalar::<f32>()?;
+            lr_scheduler.advance();
             if args.log_every > 0 && global_step % args.log_every == 0 {
                 eprintln!("step {} loss {:.4}", global_step, loss_val);
+            }
+            if let Some(gn) = debug_grad_norm {
+                eprintln!("  [debug] step {} grad_norm {:.4}", global_step, gn);
+                if let Ok(dists) = model.debug_weight_distributions() {
+                    for (name, s) in dists {
+                        eprintln!("  [debug]   {} {}", name, s);
+                    }
+                }
+            }
+            if let Some(ref val_ds) = val_dataset {
+                if args.eval_every > 0 && global_step > 0 && global_step % args.eval_every == 0 {
+                    let mut val_loss_sum = 0.0f64;
+                    let mut val_count = 0usize;
+                    for (input_ids, labels) in val_ds.batches(batch_size).take(args.eval_batches) {
+                        let (input_ids, labels) = batch_to_tensors(&input_ids, &labels, batch_size, seq_len, &device)?;
+                        let logits = model.forward(&input_ids)?;
+                        let (b, t, v) = logits.dims3()?;
+                        let logits_flat = logits.reshape((b * t, v))?;
+                        let labels_flat = labels.reshape((b * t,))?.to_dtype(DType::U32)?;
+                        let loss = cross_entropy_with_label_smoothing(&logits_flat, &labels_flat, args.label_smoothing, config.vocab_size)?;
+                        val_loss_sum += loss.to_scalar::<f32>()? as f64;
+                        val_count += 1;
+                    }
+                    if val_count > 0 {
+                        let val_loss = val_loss_sum / val_count as f64;
+                        let ppl = val_loss.exp();
+                        eprintln!("  [eval] step {} val_loss={:.4} perplexity={:.2}", global_step, val_loss, ppl);
+                    }
+                }
             }
             if global_step > 0 && global_step % 500 == 0 && args.save_every > 0 {
                 let next_ckpt = ((global_step / args.save_every) + 1) * args.save_every;
@@ -318,25 +439,52 @@ fn main() -> anyhow::Result<()> {
             config.vocab_size,
         )?;
 
-        let effective_lr = effective_lr(
-            global_step,
-            args.lr,
-            args.lr_min,
-            args.lr_warmup_steps,
-            args.max_steps,
-            &args.lr_decay,
-        );
-        optimizer.set_learning_rate(effective_lr);
+        optimizer.set_learning_rate(lr_scheduler.current_lr());
 
         let mut grads = loss.backward()?;
+        let debug_grad_norm = if args.debug_every > 0 && global_step % args.debug_every == 0 {
+            Some(grad_norm(&grads, &vars)?)
+        } else {
+            None
+        };
         if args.grad_clip_max_norm > 0.0 {
             clip_grad_norm(&mut grads, &vars, args.grad_clip_max_norm)?;
         }
         optimizer.step(&grads)?;
+        lr_scheduler.advance();
 
         let loss_val = loss.to_scalar::<f32>()?;
         if args.log_every > 0 && global_step % args.log_every == 0 {
             eprintln!("step {} epoch {} batch {} loss {:.4}", global_step, epoch, batch_idx, loss_val);
+        }
+        if let Some(gn) = debug_grad_norm {
+            eprintln!("  [debug] step {} grad_norm {:.4}", global_step, gn);
+            if let Ok(dists) = model.debug_weight_distributions() {
+                for (name, s) in dists {
+                    eprintln!("  [debug]   {} {}", name, s);
+                }
+            }
+        }
+        if let Some(ref val_ds) = val_dataset {
+            if args.eval_every > 0 && global_step > 0 && global_step % args.eval_every == 0 {
+                let mut val_loss_sum = 0.0f64;
+                let mut val_count = 0usize;
+                for (input_ids, labels) in val_ds.batches(batch_size).take(args.eval_batches) {
+                    let (input_ids, labels) = batch_to_tensors(&input_ids, &labels, batch_size, seq_len, &device)?;
+                    let logits = model.forward(&input_ids)?;
+                    let (b, t, v) = logits.dims3()?;
+                    let logits_flat = logits.reshape((b * t, v))?;
+                    let labels_flat = labels.reshape((b * t,))?.to_dtype(DType::U32)?;
+                    let loss = cross_entropy_with_label_smoothing(&logits_flat, &labels_flat, args.label_smoothing, config.vocab_size)?;
+                    val_loss_sum += loss.to_scalar::<f32>()? as f64;
+                    val_count += 1;
+                }
+                if val_count > 0 {
+                    let val_loss = val_loss_sum / val_count as f64;
+                    let ppl = val_loss.exp();
+                    eprintln!("  [eval] step {} val_loss={:.4} perplexity={:.2}", global_step, val_loss, ppl);
+                }
+            }
         }
         if global_step > 0 && global_step % 500 == 0 && args.save_every > 0 {
             let next_ckpt = ((global_step / args.save_every) + 1) * args.save_every;
