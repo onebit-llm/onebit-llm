@@ -6,10 +6,29 @@
 use std::path::PathBuf;
 
 use candle::{backprop::GradStore, DType, Device, Var};
-use candle_nn::{loss, AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
+use candle_nn::{loss, ops, AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 use clap::Parser;
 
 use onebit_llm::{batch_to_tensors, OneBitLlm, OneBitLlmConfig, StreamingBatchIter, TextDataset};
+
+/// Cross-entropy with label smoothing: (1-s)*NLL + s/V * (-sum_c log p(c)).
+fn cross_entropy_with_label_smoothing(
+    logits: &candle::Tensor,
+    labels: &candle::Tensor,
+    smoothing: f64,
+    vocab_size: usize,
+) -> candle::Result<candle::Tensor> {
+    if smoothing <= 0.0 {
+        return loss::cross_entropy(logits, labels);
+    }
+    let log_probs = ops::log_softmax(logits, 1)?;
+    let nll = loss::nll(&log_probs, labels)?;
+    let sum_log = log_probs.sum(1)?;
+    let neg_sum_mean = (sum_log.neg()?.mean_all()?.to_scalar::<f32>()?) as f64;
+    let s = smoothing;
+    let v = vocab_size as f64;
+    nll.affine(1.0 - s, s / v * neg_sum_mean)
+}
 
 /// Effective learning rate: warmup then constant or decay (cosine/linear) when max_steps > 0.
 fn effective_lr(
@@ -89,9 +108,13 @@ struct Args {
     #[arg(long, default_value = "8")]
     batch_size: usize,
 
-    /// Max training steps (0 = run until data exhausted).
+    /// Max training steps (0 = no step limit; in non-streaming, use max_epochs to stop).
     #[arg(long, default_value = "10000")]
     max_steps: usize,
+
+    /// Max epochs (non-streaming only). 0 = no limit. E.g. 10 = stop after 10 full passes over the data.
+    #[arg(long, default_value = "0")]
+    max_epochs: usize,
 
     /// Save checkpoint every N steps.
     #[arg(long, default_value = "1000")]
@@ -105,17 +128,21 @@ struct Args {
     #[arg(long, default_value = "1.0")]
     grad_clip_max_norm: f64,
 
-    /// LR warmup steps: linear warmup from 0 to lr over this many steps (0 = no warmup).
-    #[arg(long, default_value = "1000")]
+    /// LR warmup steps: linear warmup from 0 to lr (use 100–200 for small datasets like Wikitext2).
+    #[arg(long, default_value = "200")]
     lr_warmup_steps: usize,
 
-    /// Minimum LR for decay (used only when lr_decay is cosine or linear and max_steps > 0).
-    #[arg(long, default_value = "1e-5")]
+    /// Minimum LR for decay (used only when lr_decay is cosine or linear and max_steps > 0). Use 1e-6 for cosine annealing.
+    #[arg(long, default_value = "1e-6")]
     lr_min: f64,
 
     /// LR decay after warmup: cosine, linear, or none. Only applies when max_steps > 0.
     #[arg(long, default_value = "cosine", value_parser = ["cosine", "linear", "none"])]
     lr_decay: String,
+
+    /// Label smoothing for cross-entropy (e.g. 0.1). Softens targets so model learns probabilities.
+    #[arg(long, default_value = "0.1")]
+    label_smoothing: f64,
 
     /// Log loss every N steps (higher = smaller log file; 0 = only progress lines).
     #[arg(long, default_value = "100")]
@@ -186,7 +213,12 @@ fn main() -> anyhow::Result<()> {
             let (b, t, v) = logits.dims3()?;
             let logits_flat = logits.reshape((b * t, v))?;
             let labels_flat = labels.reshape((b * t,))?.to_dtype(DType::U32)?;
-            let loss = loss::cross_entropy(&logits_flat, &labels_flat)?;
+            let loss = cross_entropy_with_label_smoothing(
+                &logits_flat,
+                &labels_flat,
+                args.label_smoothing,
+                config.vocab_size,
+            )?;
 
             let effective_lr = effective_lr(
                 global_step,
@@ -252,6 +284,10 @@ fn main() -> anyhow::Result<()> {
             if args.max_steps > 0 && global_step >= args.max_steps {
                 break;
             }
+            if args.max_epochs > 0 && (epoch as usize) >= args.max_epochs {
+                eprintln!("Completed {} epochs, stopping.", args.max_epochs);
+                break;
+            }
             eprintln!("epoch {} (step {})", epoch, global_step);
 
             for (batch_idx, (input_ids, labels)) in dataset.batches(batch_size).enumerate() {
@@ -275,7 +311,12 @@ fn main() -> anyhow::Result<()> {
         let (b, t, v) = logits.dims3()?;
         let logits_flat = logits.reshape((b * t, v))?;
         let labels_flat = labels.reshape((b * t,))?.to_dtype(DType::U32)?;
-        let loss = loss::cross_entropy(&logits_flat, &labels_flat)?;
+        let loss = cross_entropy_with_label_smoothing(
+            &logits_flat,
+            &labels_flat,
+            args.label_smoothing,
+            config.vocab_size,
+        )?;
 
         let effective_lr = effective_lr(
             global_step,

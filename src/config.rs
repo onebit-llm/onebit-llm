@@ -36,6 +36,12 @@ pub struct OneBitLlmConfig {
     /// Use RoPE (rotary position embeddings) in attention.
     #[serde(default)]
     pub use_rope: bool,
+    /// QK-norm: RMSNorm on Q and K before attention (Olmo2/LLaMA-style). Stabilizes training, lowers loss.
+    #[serde(default = "default_true")]
+    pub use_qk_norm: bool,
+    /// Residual scaling: scale sublayer output by 1/sqrt(2) before adding to residual. Improves gradient flow in deep 1-bit nets.
+    #[serde(default = "default_true")]
+    pub use_residual_scaling: bool,
     /// Arenas: initial coefficient for full-precision residual path (None = disabled). Anneals to 0 over arenas_anneal_steps.
     #[serde(default)]
     pub arenas_initial: Option<f64>,
@@ -46,6 +52,10 @@ pub struct OneBitLlmConfig {
 
 fn default_arenas_anneal_steps() -> usize {
     10_000
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_layer_norm_eps() -> f64 {
@@ -66,6 +76,8 @@ impl Default for OneBitLlmConfig {
             use_relu2: false,
             use_subln: false,
             use_rope: false,
+            use_qk_norm: true,
+            use_residual_scaling: true,
             arenas_initial: None,
             arenas_anneal_steps: 10_000,
         }

@@ -49,10 +49,12 @@ fn rope_cos_sin(device: &candle::Device, seq_len: usize, head_dim: usize) -> Res
     Ok((cos, sin))
 }
 
-/// Causal self-attention with binary/ternary Q,K,V; optional RoPE on q,k.
+/// Causal self-attention with binary/ternary Q,K,V; optional RoPE on q,k; optional QK-norm (RMSNorm on Q,K).
 struct CausalSelfAttention {
     c_attn: BitLinearLayer,
     c_proj: BitLinearLayer,
+    q_norm: Option<RmsNorm>,
+    k_norm: Option<RmsNorm>,
     num_heads: usize,
     head_dim: usize,
     scale: f64,
@@ -66,10 +68,19 @@ impl CausalSelfAttention {
         let head_dim = config.head_dim();
         let c_attn = BitLinearLayer::new(hidden, 3 * hidden, config.use_ternary, vb.pp("c_attn"))?;
         let c_proj = BitLinearLayer::new(hidden, hidden, config.use_ternary, vb.pp("c_proj"))?;
+        let (q_norm, k_norm) = if config.use_qk_norm {
+            let q = rms_norm(head_dim, config.layer_norm_eps, vb.pp("q_norm"))?;
+            let k = rms_norm(head_dim, config.layer_norm_eps, vb.pp("k_norm"))?;
+            (Some(q), Some(k))
+        } else {
+            (None, None)
+        };
         let scale = 1.0 / (head_dim as f64).sqrt();
         Ok(Self {
             c_attn,
             c_proj,
+            q_norm,
+            k_norm,
             num_heads,
             head_dim,
             scale,
@@ -85,6 +96,12 @@ impl CausalSelfAttention {
         let mut q = qkv.i((.., .., .., .., 0))?.contiguous()?;
         let mut k = qkv.i((.., .., .., .., 1))?.contiguous()?;
         let v = qkv.i((.., .., .., .., 2))?.contiguous()?;
+        if let Some(ref q_norm) = self.q_norm {
+            q = q_norm.forward(&q)?;
+        }
+        if let Some(ref k_norm) = self.k_norm {
+            k = k_norm.forward(&k)?;
+        }
         if self.use_rope {
             let device = x.device();
             let (cos, sin) = rope_cos_sin(device, t, self.head_dim)?; // (t, head_dim/2)
@@ -183,12 +200,13 @@ impl NormLayer {
     }
 }
 
-/// Single decoder block: pre-norm attention + residual, pre-norm FFN + residual; optional Arenas residual.
+/// Single decoder block: pre-norm attention + residual, pre-norm FFN + residual; optional Arenas; optional residual scaling.
 struct DecoderBlock {
     attn: CausalSelfAttention,
     ln1: NormLayer,
     ff: FeedForward,
     ln2: NormLayer,
+    residual_scale: f64,
 }
 
 impl DecoderBlock {
@@ -197,15 +215,27 @@ impl DecoderBlock {
         let ln1 = NormLayer::new(config, vb.pp("ln1"))?;
         let ff = FeedForward::new(config, vb.pp("mlp"))?;
         let ln2 = NormLayer::new(config, vb.pp("ln2"))?;
-        Ok(Self { attn, ln1, ff, ln2 })
+        let residual_scale = if config.use_residual_scaling {
+            1.0 / 2.0_f64.sqrt()
+        } else {
+            1.0
+        };
+        Ok(Self {
+            attn,
+            ln1,
+            ff,
+            ln2,
+            residual_scale,
+        })
     }
 
     fn forward(&self, x: &Tensor, arenas_coef: Option<f32>) -> Result<Tensor> {
         let block_input = x;
         let residual = x;
         let x = self.ln1.forward(x)?;
-        let x = self.attn.forward(&x)?;
-        let mut x = (x + residual)?;
+        let attn_out = self.attn.forward(&x)?;
+        let scaled = attn_out.affine(self.residual_scale, 0.0)?;
+        let mut x = (residual + scaled)?;
         if let Some(c) = arenas_coef {
             let device = block_input.device();
             let c_t = Tensor::new(&[c], device)?;
@@ -213,8 +243,9 @@ impl DecoderBlock {
         }
         let residual = &x;
         let x = self.ln2.forward(&x)?;
-        let x = self.ff.forward(&x)?;
-        let mut x = (x + residual)?;
+        let ff_out = self.ff.forward(&x)?;
+        let scaled = ff_out.affine(self.residual_scale, 0.0)?;
+        let mut x = (residual + scaled)?;
         if let Some(c) = arenas_coef {
             let device = block_input.device();
             let c_t = Tensor::new(&[c], device)?;

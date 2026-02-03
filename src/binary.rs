@@ -53,7 +53,9 @@ impl BinaryLinear {
         let w_bin = ste_sign(w)?;
         let x_bin = ste_sign(x)?;
         let out = matmul_reshape(&x_bin, &w_bin.t()?)?;
-        let scale = 1.0 / (in_dim as f64).sqrt();
+        // Weight scaling (γ): preserve output energy; γ = mean(|W|) balances quantized layer.
+        let gamma = w.abs()?.mean_all()?.to_scalar::<f32>()?.max(1e-8) as f64;
+        let scale = (1.0 / (in_dim as f64).sqrt()) * gamma;
         out.affine(scale, 0.0)
     }
 }
@@ -82,7 +84,9 @@ impl TernaryLinear {
         let w_ternary = ternary_absmean_ste(w)?;
         // Activations: full-precision in training; optional 8-bit AbsMax for inference later.
         let out = matmul_reshape(x, &w_ternary.t()?)?;
-        let scale = 1.0 / (in_dim as f64).sqrt();
+        // Weight scaling (γ): mean(|W|) so quantized layer output energy is balanced.
+        let gamma = w.abs()?.mean_all()?.to_scalar::<f32>()?.max(1e-8) as f64;
+        let scale = (1.0 / (in_dim as f64).sqrt()) * gamma;
         out.affine(scale, 0.0)
     }
 }

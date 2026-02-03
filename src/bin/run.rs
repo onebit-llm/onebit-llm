@@ -60,9 +60,32 @@ fn main() -> anyhow::Result<()> {
     let config = OneBitLlmConfig::load(&config_path)
         .context("load config (run export first)")?;
 
-    let weights_path = args.model_dir.join("model.safetensors");
+    let weights_path = {
+        let primary = args.model_dir.join("model.safetensors");
+        if primary.exists() {
+            primary
+        } else {
+            // Fallback: load latest checkpoint-N.safetensors
+            let mut best: Option<(u64, PathBuf)> = None;
+            if let Ok(entries) = std::fs::read_dir(&args.model_dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.extension().map_or(false, |e| e == "safetensors") {
+                        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                            if let Some(n) = stem.strip_prefix("checkpoint-").and_then(|s| s.parse::<u64>().ok()) {
+                                if best.as_ref().map_or(true, |(b, _)| n > *b) {
+                                    best = Some((n, p));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            best.map(|(_, p)| p).unwrap_or_else(|| primary)
+        }
+    };
     if !weights_path.exists() {
-        anyhow::bail!("weights not found at {}", weights_path.display());
+        anyhow::bail!("weights not found at {} (no model.safetensors or checkpoint-*.safetensors)", weights_path.display());
     }
 
     let device = Device::cuda_if_available(0)?;
