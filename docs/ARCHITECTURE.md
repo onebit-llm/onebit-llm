@@ -53,10 +53,10 @@ Both use a per-layer, per-forward statistic (β).
 ## 5. Model architecture
 
 - **Style:** Decoder-only, GPT-like; **not** using `candle_transformers::models`.
-- **Components:** `OneBitLlm`: `wte` (embedding), `blocks: Vec<DecoderBlock>`, `ln_f`, `lm_head` (F32 linear). Each `DecoderBlock`: pre-norm attention + residual, pre-norm FFN + residual; optional Arenas (`block_input * c`), residual scaling (1/√2).
+- **Components:** `OneBitLlm`: `wte` (embedding), `blocks: Vec<DecoderBlock>`, `ln_f`. **Weight tying:** output logits use `wte` weight (no separate `lm_head`). Each `DecoderBlock`: pre-norm attention + residual, pre-norm FFN + residual; optional Arenas (`block_input * c`), residual scaling (1/√2).
 - **Attention:** `CausalSelfAttention`: QKV and output projection are `BitLinearLayer` (binary or ternary); RoPE; optional QK-norm (RmsNorm on Q, K); causal mask; softmax.
 - **FFN:** Two `BitLinearLayer`s with ReLU² or SiLU.
-- **Quantized layers:** Only the bit linears: attention `c_attn`, `c_proj`; FFN `c_fc`, `c_proj`. Embedding, all norms, and `lm_head` are F32.
+- **Quantized layers:** Only the bit linears: attention `c_attn`, `c_proj`; FFN `c_fc`, `c_proj`. Embedding and all norms are F32.
 
 ---
 

@@ -49,7 +49,8 @@ onebit-llm/
 │   ├── data.rs              # TextDataset, StreamingBatchIter
 │   └── bin/
 │       ├── train.rs         # Train CLI (accumulation, validation, LrScheduler)
-│       ├── export.rs
+│       ├── export.rs        # Copy checkpoint + config to output dir
+│       ├── export_quantized.rs  # Export ternary-quantized checkpoint (bit layers → {-1,0,+1})
 │       └── run.rs           # Inference (cache, benchmark, eval-perplexity)
 ├── data/                    # Gitignored; add tokenizer and datasets here
 ├── checkpoints/             # Gitignored; training output
@@ -73,6 +74,8 @@ CUDA is enabled in `Cargo.toml` by default (candle with `cuda`). For CPU-only, r
 ### Train
 
 You need a **config** (JSON), a **data** path (file or directory of `.txt` / `.jsonl`), and a **tokenizer** (`tokenizer.json`, e.g. GPT-2 BPE).
+
+**Recommended datasets:** For ~45M params (with weight tying), WikiText-2 (12 MB) is too small (high overfitting risk). Prefer **WikiText-103** (~500 MB) or an OpenWebText subset for better perplexity and stability. See [Datasets](#datasets) below.
 
 **Non-streaming (small data, e.g. Wikitext-2):**
 
@@ -108,6 +111,20 @@ cargo run --bin train -- \
 ```
 
 **Training options:** `--lr`, `--lr-min` (e.g. 1e-6 for cosine), `--lr-warmup-steps`, `--lr-decay` (cosine | linear | none), `--label-smoothing` (default 0.1), `--grad-clip-max-norm` (default 1.0), `--accumulation-steps` (default 1), `--val-data-dir`, `--eval-every`, `--eval-batches`.
+
+### Datasets
+
+- **WikiText-103** (recommended for ~45M params): ~500 MB; params/data ≈ 90:1.
+  ```bash
+  wget https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-103-raw-v1.zip
+  unzip wikitext-103-raw-v1.zip -d data/
+  # Train:
+  --data-dir data/wikitext-103-raw \
+  --val-data-dir data/wikitext-103-raw  # use wiki.valid.raw in same dir or a copy
+  ```
+  Use `wiki.train.raw` as data dir (single file) or point `--data-dir` to the folder and ensure `wiki.valid.raw` is available for `--val-data-dir` (e.g. same folder with both files).
+- **WikiText-2**: 12 MB; fine for quick experiments but overfitting risk for 45M params.
+- **OpenWebText** (subset): e.g. Hugging Face `Skylion007/openwebtext` → export 1% to JSONL for `--data-dir`; ideal params/data ratio with larger subsets.
 
 ### Run (inference)
 
@@ -164,6 +181,17 @@ cargo run --bin export -- \
 ```
 
 The export command prints a tip to use `run --model-dir <output_dir> --use-cached-quantized` for faster inference.
+
+**Export quantized checkpoint** (ternary layers as {-1,0,+1} for smaller size):
+
+```bash
+cargo run --bin export_quantized --release -- \
+  --config config.json \
+  --checkpoint ./checkpoints/model.safetensors \
+  --output ./checkpoints/model_quantized.safetensors
+```
+
+Quantized layers (c_attn, c_proj, c_fc) are replaced with their ternary-quantized values; embeddings and norms stay F32. Inference still uses the same `run` binary (load F32 or quantized checkpoint; quantized file has fewer unique values but same layout).
 
 ---
 

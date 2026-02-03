@@ -15,11 +15,16 @@ fn ste_sign_scaled(x: &Tensor, scale: f64) -> Result<Tensor> {
     let sign_x = x.sign()?;
     let detach_x = x.detach();
     let residual = (x - &detach_x)?;
-    Ok((&sign_x + &residual.affine(scale, 0.0)?)?)
+    &sign_x + &residual.affine(scale, 0.0)?
 }
 
 /// Ternary in *original* space with Δ = 0.7 × mean(|W|): |w| <= Δ -> 0, else sign(w). No 1/beta scaling.
-fn ternary_delta_quantize(w: &Tensor, delta: f64, ste_scale: f64, apply_ste: bool) -> Result<Tensor> {
+fn ternary_delta_quantize(
+    w: &Tensor,
+    delta: f64,
+    ste_scale: f64,
+    apply_ste: bool,
+) -> Result<Tensor> {
     let abs_w = w.abs()?;
     let mask = abs_w.gt(delta)?.to_dtype(DType::F32)?;
     let out = (w.sign()? * mask)?;
@@ -31,8 +36,9 @@ fn ternary_delta_quantize(w: &Tensor, delta: f64, ste_scale: f64, apply_ste: boo
     }
 }
 
-/// Ternary quantization (forward only, no STE). For debug stats.
-fn ternary_quantize_forward(w: &Tensor, use_dynamic_threshold: bool) -> Result<Tensor> {
+/// Ternary quantization (forward only, no STE). Returns F32 tensor with values in {-1, 0, 1}.
+/// Used for export to quantized checkpoint (then cast to i8 if desired).
+pub fn ternary_quantize_forward(w: &Tensor, use_dynamic_threshold: bool) -> Result<Tensor> {
     let abs_w = w.abs()?;
     let beta = abs_w.mean_all()?.to_scalar::<f32>()?.max(1e-8) as f64;
     if use_dynamic_threshold {
@@ -80,10 +86,21 @@ const BIT_LAYER_INIT: Init = Init::Randn {
 };
 
 impl BinaryLinear {
-    pub fn new(in_dim: usize, out_dim: usize, vb: VarBuilder, ste_scale_factor: f64, latent_clamp_max: f64) -> Result<Self> {
+    pub fn new(
+        in_dim: usize,
+        out_dim: usize,
+        vb: VarBuilder,
+        ste_scale_factor: f64,
+        latent_clamp_max: f64,
+    ) -> Result<Self> {
         let ws = vb.get_with_hints((out_dim, in_dim), "weight", BIT_LAYER_INIT)?;
         let weight = Linear::new(ws, None);
-        Ok(Self { weight, ste_scale_factor, latent_clamp_max, cache: RefCell::new(None) })
+        Ok(Self {
+            weight,
+            ste_scale_factor,
+            latent_clamp_max,
+            cache: RefCell::new(None),
+        })
     }
 
     /// Debug: counts of -1 and +1 in quantized (sign) weight.
@@ -144,10 +161,23 @@ pub struct TernaryLinear {
 }
 
 impl TernaryLinear {
-    pub fn new(in_dim: usize, out_dim: usize, vb: VarBuilder, use_dynamic_threshold: bool, ste_scale_factor: f64, latent_clamp_max: f64) -> Result<Self> {
+    pub fn new(
+        in_dim: usize,
+        out_dim: usize,
+        vb: VarBuilder,
+        use_dynamic_threshold: bool,
+        ste_scale_factor: f64,
+        latent_clamp_max: f64,
+    ) -> Result<Self> {
         let ws = vb.get_with_hints((out_dim, in_dim), "weight", BIT_LAYER_INIT)?;
         let weight = Linear::new(ws, None);
-        Ok(Self { weight, use_dynamic_threshold, ste_scale_factor, latent_clamp_max, cache: RefCell::new(None) })
+        Ok(Self {
+            weight,
+            use_dynamic_threshold,
+            ste_scale_factor,
+            latent_clamp_max,
+            cache: RefCell::new(None),
+        })
     }
 
     /// Debug: counts of -1, 0, +1 in quantized ternary weight.
@@ -181,7 +211,8 @@ impl TernaryLinear {
         let w = self.weight.weight();
         let w_use = w.clamp(-self.latent_clamp_max, self.latent_clamp_max)?;
         let in_dim = w_use.dim(1)?;
-        let w_ternary = ternary_absmean_ste(&w_use, self.use_dynamic_threshold, self.ste_scale_factor)?;
+        let w_ternary =
+            ternary_absmean_ste(&w_use, self.use_dynamic_threshold, self.ste_scale_factor)?;
         let out = matmul_reshape(x, &w_ternary.t()?)?;
         let gamma = w_use.abs()?.mean_all()?.to_scalar::<f32>()?.max(1e-8) as f64;
         let scale = (1.0 / (in_dim as f64).sqrt()) * gamma;
@@ -198,7 +229,10 @@ impl Module for TernaryLinear {
 // --- Debug: weight value distribution (-1, 0, +1 for ternary; -1, +1 for binary) ---
 
 /// Counts of -1, 0, +1 in quantized ternary weight (no STE, forward-only quantize).
-pub fn debug_ternary_distribution(w: &Tensor, use_dynamic_threshold: bool) -> Result<(u64, u64, u64)> {
+pub fn debug_ternary_distribution(
+    w: &Tensor,
+    use_dynamic_threshold: bool,
+) -> Result<(u64, u64, u64)> {
     let q = ternary_quantize_forward(w, use_dynamic_threshold)?;
     let flat = q.flatten_all()?.to_vec1::<f32>()?;
     let mut n_neg = 0u64;
@@ -236,7 +270,7 @@ pub fn debug_binary_distribution(w: &Tensor) -> Result<(u64, u64)> {
 fn matmul_reshape(x: &Tensor, w_t: &Tensor) -> Result<Tensor> {
     let dims = x.dims();
     let out_dim = w_t.dim(1)?;
-    match dims.as_ref() {
+    match dims {
         [b, m, k] => {
             let x_2d = x.reshape((*b * *m, *k))?;
             let y = x_2d.matmul(w_t)?;

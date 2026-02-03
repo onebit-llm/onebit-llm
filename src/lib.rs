@@ -3,12 +3,12 @@
 //! Provides config, binary layers, transformer model, and data pipeline
 //! for training, export, and import.
 
-pub mod config;
 pub mod binary;
-pub mod model;
+pub mod config;
 pub mod data;
+pub mod model;
 
+pub use binary::{ternary_quantize_forward, BinaryLinear, TernaryLinear};
 pub use config::OneBitLlmConfig;
-pub use binary::{BinaryLinear, TernaryLinear};
-pub use model::{OneBitLlm, CompressionStats};
 pub use data::{batch_to_tensors, StreamingBatchIter, TextDataset};
+pub use model::{CompressionStats, OneBitLlm};

@@ -10,7 +10,10 @@ use clap::Parser;
 use onebit_llm::OneBitLlmConfig;
 
 #[derive(Parser, Debug)]
-#[command(name = "export", about = "Export model to a directory (safetensors + config)")]
+#[command(
+    name = "export",
+    about = "Export model to a directory (safetensors + config)"
+)]
 struct Args {
     /// Checkpoint directory (contains model.safetensors or checkpoint-*.safetensors and config.json).
     #[arg(long)]
@@ -56,14 +59,16 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        latest
-            .map(|(_, p)| p)
-            .ok_or_else(|| anyhow::anyhow!("no model.safetensors or checkpoint-*.safetensors in {}", args.checkpoint_dir.display()))?
+        latest.map(|(_, p)| p).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no model.safetensors or checkpoint-*.safetensors in {}",
+                args.checkpoint_dir.display()
+            )
+        })?
     };
 
     let weights_dest = args.output_dir.join("model.safetensors");
-    std::fs::copy(&weights_source, &weights_dest)
-        .context("copy weights to output dir")?;
+    std::fs::copy(&weights_source, &weights_dest).context("copy weights to output dir")?;
     eprintln!("Copied weights to {}", weights_dest.display());
 
     if let Some(tok_path) = &args.tokenizer {

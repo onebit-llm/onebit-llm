@@ -3,8 +3,7 @@
 
 use candle::{DType, IndexOp, Result, Tensor, D};
 use candle_nn::{
-    embedding, layer_norm_no_bias, linear_no_bias, rms_norm, Embedding, LayerNorm, Module, RmsNorm,
-    VarBuilder,
+    embedding, layer_norm_no_bias, rms_norm, Embedding, LayerNorm, Module, RmsNorm, VarBuilder,
 };
 
 use crate::binary::{BinaryLinear, TernaryLinear};
@@ -17,7 +16,12 @@ enum BitLinearLayer {
 }
 
 impl BitLinearLayer {
-    fn new(in_dim: usize, out_dim: usize, config: &OneBitLlmConfig, vb: VarBuilder) -> Result<Self> {
+    fn new(
+        in_dim: usize,
+        out_dim: usize,
+        config: &OneBitLlmConfig,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         if config.use_ternary {
             Ok(BitLinearLayer::Ternary(TernaryLinear::new(
                 in_dim,
@@ -75,7 +79,11 @@ impl BitLinearLayer {
 }
 
 /// Build RoPE cos and sin for shape (seq_len, head_dim/2). Standard RoPE: theta_i = 10000^(-2i/d).
-fn rope_cos_sin(device: &candle::Device, seq_len: usize, head_dim: usize) -> Result<(Tensor, Tensor)> {
+fn rope_cos_sin(
+    device: &candle::Device,
+    seq_len: usize,
+    head_dim: usize,
+) -> Result<(Tensor, Tensor)> {
     let d2 = head_dim / 2;
     let inv_freq: Vec<f32> = (0..d2)
         .map(|i| 1.0 / 10000f32.powf(2.0 * i as f32 / head_dim as f32))
@@ -204,8 +212,18 @@ struct FeedForward {
 
 impl FeedForward {
     fn new(config: &OneBitLlmConfig, vb: VarBuilder) -> Result<Self> {
-        let c_fc = BitLinearLayer::new(config.hidden_size, config.intermediate_size, config, vb.pp("c_fc"))?;
-        let c_proj = BitLinearLayer::new(config.intermediate_size, config.hidden_size, config, vb.pp("c_proj"))?;
+        let c_fc = BitLinearLayer::new(
+            config.hidden_size,
+            config.intermediate_size,
+            config,
+            vb.pp("c_fc"),
+        )?;
+        let c_proj = BitLinearLayer::new(
+            config.intermediate_size,
+            config.hidden_size,
+            config,
+            vb.pp("c_proj"),
+        )?;
         Ok(Self {
             c_fc,
             c_proj,
@@ -335,8 +353,13 @@ impl DecoderBlock {
 
     fn debug_weight_distributions(&self, block_idx: usize) -> Vec<(String, Result<String>)> {
         let prefix = format!("h.{}", block_idx);
-        let mut out = self.attn.debug_weight_distributions(&format!("{}.attn", prefix));
-        out.extend(self.ff.debug_weight_distributions(&format!("{}.mlp", prefix)));
+        let mut out = self
+            .attn
+            .debug_weight_distributions(&format!("{}.attn", prefix));
+        out.extend(
+            self.ff
+                .debug_weight_distributions(&format!("{}.mlp", prefix)),
+        );
         out
     }
 
@@ -353,11 +376,11 @@ impl DecoderBlock {
 }
 
 /// OneBit-LLM: decoder-only transformer with binary/ternary attention and FFN; optional RoPE, ReLU², subln, Arenas.
+/// Weight tying: wte (token embedding) and output projection (lm_head) share the same weights; lm_head is not stored.
 pub struct OneBitLlm {
     wte: Embedding,
     blocks: Vec<DecoderBlock>,
     ln_f: NormLayer,
-    lm_head: candle_nn::Linear,
     config: OneBitLlmConfig,
 }
 
@@ -370,12 +393,10 @@ impl OneBitLlm {
             blocks.push(block);
         }
         let ln_f = NormLayer::new(config, vb.pp("ln_f"))?;
-        let lm_head = linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?;
         Ok(Self {
             wte,
             blocks,
             ln_f,
-            lm_head,
             config: config.clone(),
         })
     }
@@ -396,7 +417,8 @@ impl OneBitLlm {
             x = block.forward(&x, arenas_coef)?;
         }
         x = self.ln_f.forward(&x)?;
-        self.lm_head.forward(&x)
+        let wte_weight = self.wte.embeddings();
+        x.matmul(&wte_weight.t()?)
     }
 
     pub fn config(&self) -> &OneBitLlmConfig {
@@ -451,19 +473,20 @@ impl OneBitLlmConfig {
         let i = self.intermediate_size;
 
         let wte = vocab * h;
-        let lm_head = h * vocab;
         let per_block_attn = h * (3 * h) + h * h;
         let per_block_ff = h * i + i * h;
         let quantized_per_block = per_block_attn + per_block_ff;
 
         let norm_params = (n * 2 + 1) * h; // ln1, ln2 per block + ln_f; approx
         let qk_norm = if self.use_qk_norm { n * 2 * h } else { 0 };
-        let total = wte + lm_head + n * (per_block_attn + per_block_ff + norm_params) + qk_norm;
+        let total = wte + n * (per_block_attn + per_block_ff + norm_params) + qk_norm;
         let quantized = n * quantized_per_block;
 
         let bits_quantized = 2.0; // ternary
         let bits_full = 32.0;
-        let effective_bits = (quantized as f64 * bits_quantized + (total.saturating_sub(quantized)) as f64 * bits_full) / total.max(1) as f64;
+        let effective_bits = (quantized as f64 * bits_quantized
+            + (total.saturating_sub(quantized)) as f64 * bits_full)
+            / total.max(1) as f64;
         let compression_ratio_vs_f32 = bits_full / effective_bits;
 
         CompressionStats {

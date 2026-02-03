@@ -29,3 +29,7 @@ path = "src/bin/export.rs"
 [[bin]]
 name = "run"
 path = "src/bin/run.rs"
+
+[[bin]]
+name = "export_quantized"
+path = "src/bin/export_quantized.rs"

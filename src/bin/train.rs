@@ -3,6 +3,7 @@
 //! Usage: train --config config.json --data-dir /path/to/texts --output-dir ./checkpoints [options]
 //! For 1-bit/ternary stability: use gradient clipping (default 1.0), lower LR (e.g. 1e-4), and warmup.
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use candle::{backprop::GradStore, DType, Device, Var};
@@ -43,7 +44,14 @@ struct LrScheduler {
 
 impl LrScheduler {
     fn new(lr: f64, lr_min: f64, warmup_steps: usize, max_steps: usize, lr_decay: String) -> Self {
-        Self { step: 0, lr, lr_min, warmup_steps, max_steps, lr_decay }
+        Self {
+            step: 0,
+            lr,
+            lr_min,
+            warmup_steps,
+            max_steps,
+            lr_decay,
+        }
     }
 
     fn current_lr(&self) -> f64 {
@@ -97,7 +105,11 @@ fn clip_grad_norm(grads: &mut GradStore, vars: &[Var], max_norm: f64) -> anyhow:
         }
     }
     let total_norm = total_norm_sq.sqrt().max(1e-12);
-    let scale = if total_norm > max_norm { max_norm / total_norm } else { 1.0 };
+    let scale = if total_norm > max_norm {
+        max_norm / total_norm
+    } else {
+        1.0
+    };
     for var in vars.iter() {
         if let Some(g) = grads.remove(var.as_tensor()) {
             let clipped = g.affine(scale, 0.0)?;
@@ -254,20 +266,31 @@ fn main() -> anyhow::Result<()> {
     let val_dataset: Option<TextDataset> = if let Some(ref p) = args.val_data_dir {
         let mut ds = TextDataset::new(p, &args.tokenizer, seq_len)?;
         ds.load()?;
-        eprintln!("Validation: loaded {} sequences (eval_every={}, eval_batches={})", ds.num_sequences(), args.eval_every, args.eval_batches);
+        eprintln!(
+            "Validation: loaded {} sequences (eval_every={}, eval_batches={})",
+            ds.num_sequences(),
+            args.eval_every,
+            args.eval_batches
+        );
         Some(ds)
+    } else {
+        None
+    };
+
+    let mut metrics_file: Option<std::fs::File> = if val_dataset.is_some() {
+        let p = args.output_dir.join("metrics.csv");
+        let mut f = std::fs::File::create(&p)?;
+        writeln!(f, "step,val_loss,perplexity")?;
+        eprintln!("Metrics log: {}", p.display());
+        Some(f)
     } else {
         None
     };
 
     if args.streaming {
         eprintln!("Streaming mode: reading files line-by-line (stage1 + stage2)");
-        let mut stream = StreamingBatchIter::new(
-            &args.data_dir,
-            &args.tokenizer,
-            seq_len,
-            batch_size,
-        )?;
+        let mut stream =
+            StreamingBatchIter::new(&args.data_dir, &args.tokenizer, seq_len, batch_size)?;
         loop {
             if args.max_steps > 0 && global_step >= args.max_steps {
                 break;
@@ -290,13 +313,8 @@ fn main() -> anyhow::Result<()> {
             let mut total_loss = None;
             let mut loss_sum = 0.0f32;
             for (input_ids, labels) in batches {
-                let (input_ids, labels) = batch_to_tensors(
-                    &input_ids,
-                    &labels,
-                    batch_size,
-                    seq_len,
-                    &device,
-                )?;
+                let (input_ids, labels) =
+                    batch_to_tensors(&input_ids, &labels, batch_size, seq_len, &device)?;
                 let logits = model.forward_with_arenas(&input_ids, arenas_coef)?;
                 let (b, t, v) = logits.dims3()?;
                 let logits_flat = logits.reshape((b * t, v))?;
@@ -319,7 +337,7 @@ fn main() -> anyhow::Result<()> {
 
             optimizer.set_learning_rate(lr_scheduler.current_lr());
             let mut grads = total_loss.backward()?;
-            let debug_grad_norm = if args.debug_every > 0 && global_step % args.debug_every == 0 {
+            let debug_grad_norm = if args.debug_every > 0 && global_step.is_multiple_of(args.debug_every) {
                 Some(grad_norm(&grads, &vars)?)
             } else {
                 None
@@ -329,7 +347,7 @@ fn main() -> anyhow::Result<()> {
             }
             optimizer.step(&grads)?;
             lr_scheduler.advance();
-            if args.log_every > 0 && global_step % args.log_every == 0 {
+            if args.log_every > 0 && global_step.is_multiple_of(args.log_every) {
                 eprintln!("step {} loss {:.4}", global_step, loss_val);
             }
             if let Some(gn) = debug_grad_norm {
@@ -341,31 +359,46 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             if let Some(ref val_ds) = val_dataset {
-                if args.eval_every > 0 && global_step > 0 && global_step % args.eval_every == 0 {
+                if args.eval_every > 0 && global_step > 0 && global_step.is_multiple_of(args.eval_every) {
                     let mut val_loss_sum = 0.0f64;
                     let mut val_count = 0usize;
                     for (input_ids, labels) in val_ds.batches(batch_size).take(args.eval_batches) {
-                        let (input_ids, labels) = batch_to_tensors(&input_ids, &labels, batch_size, seq_len, &device)?;
+                        let (input_ids, labels) =
+                            batch_to_tensors(&input_ids, &labels, batch_size, seq_len, &device)?;
                         let logits = model.forward(&input_ids)?;
                         let (b, t, v) = logits.dims3()?;
                         let logits_flat = logits.reshape((b * t, v))?;
                         let labels_flat = labels.reshape((b * t,))?.to_dtype(DType::U32)?;
-                        let loss = cross_entropy_with_label_smoothing(&logits_flat, &labels_flat, args.label_smoothing, config.vocab_size)?;
+                        let loss = cross_entropy_with_label_smoothing(
+                            &logits_flat,
+                            &labels_flat,
+                            args.label_smoothing,
+                            config.vocab_size,
+                        )?;
                         val_loss_sum += loss.to_scalar::<f32>()? as f64;
                         val_count += 1;
                     }
                     if val_count > 0 {
                         let val_loss = val_loss_sum / val_count as f64;
                         let ppl = val_loss.exp();
-                        eprintln!("  [eval] step {} val_loss={:.4} perplexity={:.2}", global_step, val_loss, ppl);
+                        eprintln!(
+                            "  [eval] step {} val_loss={:.4} perplexity={:.2}",
+                            global_step, val_loss, ppl
+                        );
+                        if let Some(ref mut f) = metrics_file {
+                            writeln!(f, "{},{},{}", global_step, val_loss, ppl)?;
+                        }
                     }
                 }
             }
-            if global_step > 0 && global_step % 500 == 0 && args.save_every > 0 {
+            if global_step > 0 && global_step.is_multiple_of(500) && args.save_every > 0 {
                 let next_ckpt = ((global_step / args.save_every) + 1) * args.save_every;
-                eprintln!("  -> progress: {} steps (next checkpoint at step {})", global_step, next_ckpt);
+                eprintln!(
+                    "  -> progress: {} steps (next checkpoint at step {})",
+                    global_step, next_ckpt
+                );
             }
-            if global_step > 0 && global_step % 500 == 0 {
+            if global_step > 0 && global_step.is_multiple_of(500) {
                 let _ = std::fs::write(
                     args.output_dir.join("progress.txt"),
                     format!("step {} loss {:.4}\n", global_step, loss_val),
@@ -374,19 +407,17 @@ fn main() -> anyhow::Result<()> {
 
             global_step += 1;
 
-            if args.save_every > 0 && global_step % args.save_every == 0 {
-                let ckpt_path = args.output_dir.join(format!("checkpoint-{}.safetensors", global_step));
+            if args.save_every > 0 && global_step.is_multiple_of(args.save_every) {
+                let ckpt_path = args
+                    .output_dir
+                    .join(format!("checkpoint-{}.safetensors", global_step));
                 varmap.save(&ckpt_path)?;
                 config.save(&args.output_dir.join("config.json"))?;
                 eprintln!("Saved checkpoint to {}", ckpt_path.display());
             }
         }
     } else {
-        let mut dataset = TextDataset::new(
-            &args.data_dir,
-            &args.tokenizer,
-            config.max_seq_len,
-        )?;
+        let mut dataset = TextDataset::new(&args.data_dir, &args.tokenizer, config.max_seq_len)?;
         dataset.load()?;
 
         let num_tokens = dataset.num_tokens();
@@ -411,100 +442,137 @@ fn main() -> anyhow::Result<()> {
             }
             eprintln!("epoch {} (step {})", epoch, global_step);
 
-            for (batch_idx, (input_ids, labels)) in dataset.batches(batch_size).enumerate() {
+            let mut batch_iter = dataset.batches(batch_size).enumerate().peekable();
+            while batch_iter.peek().is_some() {
                 if args.max_steps > 0 && global_step >= args.max_steps {
                     break;
                 }
-
-                let (input_ids, labels) = batch_to_tensors(
-            &input_ids,
-            &labels,
-            batch_size,
-            seq_len,
-            &device,
-        )?;
-
-        let arenas_coef = config.arenas_initial.map(|init| {
-            let progress = global_step as f64 / config.arenas_anneal_steps as f64;
-            (init * (1.0 - progress.min(1.0))) as f32
-        });
-        let logits = model.forward_with_arenas(&input_ids, arenas_coef)?;
-        let (b, t, v) = logits.dims3()?;
-        let logits_flat = logits.reshape((b * t, v))?;
-        let labels_flat = labels.reshape((b * t,))?.to_dtype(DType::U32)?;
-        let loss = cross_entropy_with_label_smoothing(
-            &logits_flat,
-            &labels_flat,
-            args.label_smoothing,
-            config.vocab_size,
-        )?;
-
-        optimizer.set_learning_rate(lr_scheduler.current_lr());
-
-        let mut grads = loss.backward()?;
-        let debug_grad_norm = if args.debug_every > 0 && global_step % args.debug_every == 0 {
-            Some(grad_norm(&grads, &vars)?)
-        } else {
-            None
-        };
-        if args.grad_clip_max_norm > 0.0 {
-            clip_grad_norm(&mut grads, &vars, args.grad_clip_max_norm)?;
-        }
-        optimizer.step(&grads)?;
-        lr_scheduler.advance();
-
-        let loss_val = loss.to_scalar::<f32>()?;
-        if args.log_every > 0 && global_step % args.log_every == 0 {
-            eprintln!("step {} epoch {} batch {} loss {:.4}", global_step, epoch, batch_idx, loss_val);
-        }
-        if let Some(gn) = debug_grad_norm {
-            eprintln!("  [debug] step {} grad_norm {:.4}", global_step, gn);
-            if let Ok(dists) = model.debug_weight_distributions() {
-                for (name, s) in dists {
-                    eprintln!("  [debug]   {} {}", name, s);
+                let batches: Vec<_> = batch_iter.by_ref().take(args.accumulation_steps).collect();
+                if batches.is_empty() {
+                    break;
                 }
-            }
-        }
-        if let Some(ref val_ds) = val_dataset {
-            if args.eval_every > 0 && global_step > 0 && global_step % args.eval_every == 0 {
-                let mut val_loss_sum = 0.0f64;
-                let mut val_count = 0usize;
-                for (input_ids, labels) in val_ds.batches(batch_size).take(args.eval_batches) {
-                    let (input_ids, labels) = batch_to_tensors(&input_ids, &labels, batch_size, seq_len, &device)?;
-                    let logits = model.forward(&input_ids)?;
+                let n = batches.len();
+                let arenas_coef = config.arenas_initial.map(|init| {
+                    let progress = global_step as f64 / config.arenas_anneal_steps as f64;
+                    (init * (1.0 - progress.min(1.0))) as f32
+                });
+                let mut total_loss = None;
+                let mut loss_sum = 0.0f32;
+                for (_batch_idx, (input_ids, labels)) in batches {
+                    let (input_ids, labels) =
+                        batch_to_tensors(&input_ids, &labels, batch_size, seq_len, &device)?;
+                    let logits = model.forward_with_arenas(&input_ids, arenas_coef)?;
                     let (b, t, v) = logits.dims3()?;
                     let logits_flat = logits.reshape((b * t, v))?;
                     let labels_flat = labels.reshape((b * t,))?.to_dtype(DType::U32)?;
-                    let loss = cross_entropy_with_label_smoothing(&logits_flat, &labels_flat, args.label_smoothing, config.vocab_size)?;
-                    val_loss_sum += loss.to_scalar::<f32>()? as f64;
-                    val_count += 1;
+                    let loss = cross_entropy_with_label_smoothing(
+                        &logits_flat,
+                        &labels_flat,
+                        args.label_smoothing,
+                        config.vocab_size,
+                    )?;
+                    loss_sum += loss.to_scalar::<f32>()?;
+                    let scaled = loss.affine(1.0 / n as f64, 0.0)?;
+                    total_loss = Some(match total_loss {
+                        None => scaled,
+                        Some(prev) => (prev + scaled)?,
+                    });
                 }
-                if val_count > 0 {
-                    let val_loss = val_loss_sum / val_count as f64;
-                    let ppl = val_loss.exp();
-                    eprintln!("  [eval] step {} val_loss={:.4} perplexity={:.2}", global_step, val_loss, ppl);
+                let total_loss = total_loss.unwrap();
+                let loss_val = loss_sum / n as f32;
+
+                optimizer.set_learning_rate(lr_scheduler.current_lr());
+                let mut grads = total_loss.backward()?;
+                let debug_grad_norm = if args.debug_every > 0 && global_step.is_multiple_of(args.debug_every)
+                {
+                    Some(grad_norm(&grads, &vars)?)
+                } else {
+                    None
+                };
+                if args.grad_clip_max_norm > 0.0 {
+                    clip_grad_norm(&mut grads, &vars, args.grad_clip_max_norm)?;
                 }
-            }
-        }
-        if global_step > 0 && global_step % 500 == 0 && args.save_every > 0 {
-            let next_ckpt = ((global_step / args.save_every) + 1) * args.save_every;
-            eprintln!("  -> progress: {} steps (next checkpoint at step {})", global_step, next_ckpt);
-        }
-        if global_step > 0 && global_step % 500 == 0 {
-            let _ = std::fs::write(
-                args.output_dir.join("progress.txt"),
-                format!("step {} loss {:.4}\n", global_step, loss_val),
-            );
-        }
+                optimizer.step(&grads)?;
+                lr_scheduler.advance();
 
-        global_step += 1;
+                if args.log_every > 0 && global_step.is_multiple_of(args.log_every) {
+                    eprintln!(
+                        "step {} epoch {} loss {:.4} (effective_batch={})",
+                        global_step,
+                        epoch,
+                        loss_val,
+                        batch_size * n
+                    );
+                }
+                if let Some(gn) = debug_grad_norm {
+                    eprintln!("  [debug] step {} grad_norm {:.4}", global_step, gn);
+                    if let Ok(dists) = model.debug_weight_distributions() {
+                        for (name, s) in dists {
+                            eprintln!("  [debug]   {} {}", name, s);
+                        }
+                    }
+                }
+                if let Some(ref val_ds) = val_dataset {
+                    if args.eval_every > 0 && global_step > 0 && global_step.is_multiple_of(args.eval_every)
+                    {
+                        let mut val_loss_sum = 0.0f64;
+                        let mut val_count = 0usize;
+                        for (input_ids, labels) in
+                            val_ds.batches(batch_size).take(args.eval_batches)
+                        {
+                            let (input_ids, labels) = batch_to_tensors(
+                                &input_ids, &labels, batch_size, seq_len, &device,
+                            )?;
+                            let logits = model.forward(&input_ids)?;
+                            let (b, t, v) = logits.dims3()?;
+                            let logits_flat = logits.reshape((b * t, v))?;
+                            let labels_flat = labels.reshape((b * t,))?.to_dtype(DType::U32)?;
+                            let loss = cross_entropy_with_label_smoothing(
+                                &logits_flat,
+                                &labels_flat,
+                                args.label_smoothing,
+                                config.vocab_size,
+                            )?;
+                            val_loss_sum += loss.to_scalar::<f32>()? as f64;
+                            val_count += 1;
+                        }
+                        if val_count > 0 {
+                            let val_loss = val_loss_sum / val_count as f64;
+                            let ppl = val_loss.exp();
+                            eprintln!(
+                                "  [eval] step {} val_loss={:.4} perplexity={:.2}",
+                                global_step, val_loss, ppl
+                            );
+                            if let Some(ref mut f) = metrics_file {
+                                writeln!(f, "{},{},{}", global_step, val_loss, ppl)?;
+                            }
+                        }
+                    }
+                }
+                if global_step > 0 && global_step.is_multiple_of(500) && args.save_every > 0 {
+                    let next_ckpt = ((global_step / args.save_every) + 1) * args.save_every;
+                    eprintln!(
+                        "  -> progress: {} steps (next checkpoint at step {})",
+                        global_step, next_ckpt
+                    );
+                }
+                if global_step > 0 && global_step.is_multiple_of(500) {
+                    let _ = std::fs::write(
+                        args.output_dir.join("progress.txt"),
+                        format!("step {} loss {:.4}\n", global_step, loss_val),
+                    );
+                }
 
-            if args.save_every > 0 && global_step % args.save_every == 0 {
-                let ckpt_path = args.output_dir.join(format!("checkpoint-{}.safetensors", global_step));
-                varmap.save(&ckpt_path)?;
-                config.save(&args.output_dir.join("config.json"))?;
-                eprintln!("Saved checkpoint to {}", ckpt_path.display());
-            }
+                global_step += 1;
+
+                if args.save_every > 0 && global_step.is_multiple_of(args.save_every) {
+                    let ckpt_path = args
+                        .output_dir
+                        .join(format!("checkpoint-{}.safetensors", global_step));
+                    varmap.save(&ckpt_path)?;
+                    config.save(&args.output_dir.join("config.json"))?;
+                    eprintln!("Saved checkpoint to {}", ckpt_path.display());
+                }
             }
             epoch += 1;
         }
@@ -513,7 +581,10 @@ fn main() -> anyhow::Result<()> {
     let final_path = args.output_dir.join("model.safetensors");
     varmap.save(&final_path)?;
     config.save(&args.output_dir.join("config.json"))?;
-    eprintln!("Training done. Saved final weights to {}", final_path.display());
+    eprintln!(
+        "Training done. Saved final weights to {}",
+        final_path.display()
+    );
 
     Ok(())
 }

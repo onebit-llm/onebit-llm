@@ -108,7 +108,7 @@ impl OneBitLlmConfig {
     /// Head dimension (hidden_size / num_heads). Panics if not divisible.
     pub fn head_dim(&self) -> usize {
         assert!(
-            self.hidden_size % self.num_heads == 0,
+            self.hidden_size.is_multiple_of(self.num_heads),
             "hidden_size must be divisible by num_heads"
         );
         self.hidden_size / self.num_heads

@@ -69,8 +69,7 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let config_path = args.model_dir.join("config.json");
-    let config = OneBitLlmConfig::load(&config_path)
-        .context("load config (run export first)")?;
+    let config = OneBitLlmConfig::load(&config_path).context("load config (run export first)")?;
 
     let weights_path = {
         let primary = args.model_dir.join("model.safetensors");
@@ -82,10 +81,13 @@ fn main() -> anyhow::Result<()> {
             if let Ok(entries) = std::fs::read_dir(&args.model_dir) {
                 for e in entries.flatten() {
                     let p = e.path();
-                    if p.extension().map_or(false, |e| e == "safetensors") {
+                    if p.extension().is_some_and(|e| e == "safetensors") {
                         if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                            if let Some(n) = stem.strip_prefix("checkpoint-").and_then(|s| s.parse::<u64>().ok()) {
-                                if best.as_ref().map_or(true, |(b, _)| n > *b) {
+                            if let Some(n) = stem
+                                .strip_prefix("checkpoint-")
+                                .and_then(|s| s.parse::<u64>().ok())
+                            {
+                                if best.as_ref().is_none_or(|(b, _)| n > *b) {
                                     best = Some((n, p));
                                 }
                             }
@@ -97,7 +99,10 @@ fn main() -> anyhow::Result<()> {
         }
     };
     if !weights_path.exists() {
-        anyhow::bail!("weights not found at {} (no model.safetensors or checkpoint-*.safetensors)", weights_path.display());
+        anyhow::bail!(
+            "weights not found at {} (no model.safetensors or checkpoint-*.safetensors)",
+            weights_path.display()
+        );
     }
 
     let device = Device::cuda_if_available(0)?;
@@ -109,7 +114,9 @@ fn main() -> anyhow::Result<()> {
     eprintln!("Loaded model from {}", args.model_dir.display());
 
     if args.use_cached_quantized {
-        model.cache_quantized_weights().context("cache quantized weights")?;
+        model
+            .cache_quantized_weights()
+            .context("cache quantized weights")?;
         eprintln!("Cached quantized weights for inference.");
     }
 
@@ -125,8 +132,9 @@ fn main() -> anyhow::Result<()> {
                 tokenizer_path.display()
             );
         }
-        let _tokenizer = Tokenizer::from_file(tokenizer_path.as_os_str().to_string_lossy().into_owned())
-            .map_err(|e| anyhow::anyhow!("load tokenizer: {}", e))?;
+        let _tokenizer =
+            Tokenizer::from_file(tokenizer_path.as_os_str().to_string_lossy().into_owned())
+                .map_err(|e| anyhow::anyhow!("load tokenizer: {}", e))?;
         let mut dataset = TextDataset::new(eval_path, &tokenizer_path, config.max_seq_len)
             .context("create eval dataset")?;
         dataset.load()?;
@@ -135,7 +143,8 @@ fn main() -> anyhow::Result<()> {
         let mut loss_sum = 0.0f64;
         let mut count = 0usize;
         for (input_ids, labels) in dataset.batches(batch_size).take(500) {
-            let (input_ids, labels) = batch_to_tensors(&input_ids, &labels, batch_size, seq_len, &device)?;
+            let (input_ids, labels) =
+                batch_to_tensors(&input_ids, &labels, batch_size, seq_len, &device)?;
             let logits = model.forward(&input_ids)?;
             let (b, t, v) = logits.dims3()?;
             let logits_flat = logits.reshape((b * t, v))?;
@@ -147,7 +156,10 @@ fn main() -> anyhow::Result<()> {
         if count > 0 {
             let avg_loss = loss_sum / count as f64;
             let ppl = avg_loss.exp();
-            eprintln!("Eval perplexity: loss={:.4} perplexity={:.2} ({} batches)", avg_loss, ppl, count);
+            eprintln!(
+                "Eval perplexity: loss={:.4} perplexity={:.2} ({} batches)",
+                avg_loss, ppl, count
+            );
         } else {
             eprintln!("No batches for eval.");
         }
@@ -165,7 +177,8 @@ fn main() -> anyhow::Result<()> {
         }
         let start = std::time::Instant::now();
         for _ in 0..args.benchmark {
-            let input = candle::Tensor::from_vec(dummy_ids.clone(), (batch_size, seq_len), &device)?;
+            let input =
+                candle::Tensor::from_vec(dummy_ids.clone(), (batch_size, seq_len), &device)?;
             let _ = model.forward(&input)?;
         }
         let elapsed = start.elapsed().as_secs_f64();
@@ -187,8 +200,9 @@ fn main() -> anyhow::Result<()> {
                 tokenizer_path.display()
             );
         }
-        let tokenizer = Tokenizer::from_file(tokenizer_path.as_os_str().to_string_lossy().into_owned())
-            .map_err(|e| anyhow::anyhow!("load tokenizer: {}", e))?;
+        let tokenizer =
+            Tokenizer::from_file(tokenizer_path.as_os_str().to_string_lossy().into_owned())
+                .map_err(|e| anyhow::anyhow!("load tokenizer: {}", e))?;
         eprintln!("Chat mode. Type a message and press Enter. Empty line or 'quit' to exit.");
         eprintln!("---");
         let stdin = io::stdin();
@@ -199,7 +213,10 @@ fn main() -> anyhow::Result<()> {
             let mut line = String::new();
             stdin.lock().read_line(&mut line)?;
             let line = line.trim();
-            if line.is_empty() || line.eq_ignore_ascii_case("quit") || line.eq_ignore_ascii_case("exit") {
+            if line.is_empty()
+                || line.eq_ignore_ascii_case("quit")
+                || line.eq_ignore_ascii_case("exit")
+            {
                 break;
             }
             let enc = tokenizer
@@ -234,8 +251,9 @@ fn main() -> anyhow::Result<()> {
                 tokenizer_path.display()
             );
         }
-        let tokenizer = Tokenizer::from_file(tokenizer_path.as_os_str().to_string_lossy().into_owned())
-            .map_err(|e| anyhow::anyhow!("load tokenizer: {}", e))?;
+        let tokenizer =
+            Tokenizer::from_file(tokenizer_path.as_os_str().to_string_lossy().into_owned())
+                .map_err(|e| anyhow::anyhow!("load tokenizer: {}", e))?;
 
         let enc = tokenizer
             .encode(prompt.as_str(), true)
@@ -246,11 +264,7 @@ fn main() -> anyhow::Result<()> {
             let seq_len = input_ids.len().min(config.max_seq_len);
             let start = input_ids.len().saturating_sub(seq_len);
             let context: Vec<u32> = input_ids[start..].to_vec();
-            let input = candle::Tensor::from_vec(
-                context.clone(),
-                (1, seq_len),
-                &device,
-            )?;
+            let input = candle::Tensor::from_vec(context.clone(), (1, seq_len), &device)?;
             let logits = model.forward(&input)?;
             let logits = logits.i((0, seq_len - 1))?;
             let next_token = sample_next_token(&logits, args.temperature)?;
@@ -272,10 +286,7 @@ fn main() -> anyhow::Result<()> {
         let dummy_ids = vec![0u32; batch_size * seq_len];
         let input = candle::Tensor::from_vec(dummy_ids, (batch_size, seq_len), &device)?;
         let logits = model.forward(&input)?;
-        eprintln!(
-            "Dummy forward pass: logits shape {:?}",
-            logits.shape()
-        );
+        eprintln!("Dummy forward pass: logits shape {:?}", logits.shape());
     }
 
     Ok(())

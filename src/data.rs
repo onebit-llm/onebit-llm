@@ -30,8 +30,9 @@ impl TextDataset {
     /// Create dataset from a path (file or dir) and tokenizer JSON path.
     /// Reads all text, tokenizes, and chunks into seq_len. Call load() after new().
     pub fn new(path: &Path, tokenizer_path: &Path, seq_len: usize) -> anyhow::Result<Self> {
-        let tokenizer = Tokenizer::from_file(tokenizer_path.as_os_str().to_string_lossy().to_string())
-            .map_err(|e| anyhow::anyhow!("load tokenizer: {}", e))?;
+        let tokenizer =
+            Tokenizer::from_file(tokenizer_path.as_os_str().to_string_lossy().to_string())
+                .map_err(|e| anyhow::anyhow!("load tokenizer: {}", e))?;
         Ok(Self {
             path: path.to_path_buf(),
             tokenizer,
@@ -117,10 +118,7 @@ impl TextDataset {
 
     /// Yield batches: (input_ids, labels). labels are shifted by 1 for next-token prediction.
     /// Each batch is (batch_size, seq_len). Stops when not enough tokens for a full batch.
-    pub fn batches(
-        &self,
-        batch_size: usize,
-    ) -> impl Iterator<Item = (Vec<u32>, Vec<u32>)> + '_ {
+    pub fn batches(&self, batch_size: usize) -> impl Iterator<Item = (Vec<u32>, Vec<u32>)> + '_ {
         let seq_len = self.seq_len;
         let tokens = &self.token_ids;
         let total = tokens.len();
@@ -165,8 +163,9 @@ impl StreamingBatchIter {
         seq_len: usize,
         batch_size: usize,
     ) -> AnyhowResult<Self> {
-        let tokenizer = Tokenizer::from_file(tokenizer_path.as_os_str().to_string_lossy().to_string())
-            .map_err(|e| anyhow::anyhow!("load tokenizer: {}", e))?;
+        let tokenizer =
+            Tokenizer::from_file(tokenizer_path.as_os_str().to_string_lossy().to_string())
+                .map_err(|e| anyhow::anyhow!("load tokenizer: {}", e))?;
         let files = Self::collect_files(path)?;
         let current_reader = if files.is_empty() {
             None
@@ -294,15 +293,7 @@ pub fn batch_to_tensors(
     seq_len: usize,
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
-    let input = Tensor::from_vec(
-        input_ids.to_vec(),
-        (batch_size, seq_len),
-        device,
-    )?;
-    let labels = Tensor::from_vec(
-        labels.to_vec(),
-        (batch_size, seq_len),
-        device,
-    )?;
+    let input = Tensor::from_vec(input_ids.to_vec(), (batch_size, seq_len), device)?;
+    let labels = Tensor::from_vec(labels.to_vec(), (batch_size, seq_len), device)?;
     Ok((input, labels))
 }
