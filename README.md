@@ -1,5 +1,9 @@
 # OneBit-LLM
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-2021%20edition-orange)](https://www.rust-lang.org/)
+[![Contributions welcome](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
 1-bit decoder-only LLM in Rust with **binary/ternary** layers: weights are quantized to ±1 (binary) or {-1,0,+1} (ternary) in the forward pass; gradients use the straight-through estimator (STE); training remains in full precision.
 
 ---
@@ -208,6 +212,12 @@ Defaults are in `src/config.rs`. `vocab_size` must match the tokenizer.
 - `src/bin/train.rs` — Training CLI (accumulation, validation, LrScheduler).
 - `src/bin/run.rs` — Inference CLI (cache, benchmark, eval-perplexity).
 - `src/bin/export.rs` — Export CLI.
+
+---
+
+## Contributing
+
+We welcome contributions: code, documentation, issues, and ideas. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for how to contribute (fork, PR, join the org). By participating, you agree to our **[Code of Conduct](CODE_OF_CONDUCT.md)**.
 
 ---
 
