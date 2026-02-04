@@ -337,11 +337,12 @@ fn main() -> anyhow::Result<()> {
 
             optimizer.set_learning_rate(lr_scheduler.current_lr());
             let mut grads = total_loss.backward()?;
-            let debug_grad_norm = if args.debug_every > 0 && global_step.is_multiple_of(args.debug_every) {
-                Some(grad_norm(&grads, &vars)?)
-            } else {
-                None
-            };
+            let debug_grad_norm =
+                if args.debug_every > 0 && global_step.is_multiple_of(args.debug_every) {
+                    Some(grad_norm(&grads, &vars)?)
+                } else {
+                    None
+                };
             if args.grad_clip_max_norm > 0.0 {
                 clip_grad_norm(&mut grads, &vars, args.grad_clip_max_norm)?;
             }
@@ -359,7 +360,10 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             if let Some(ref val_ds) = val_dataset {
-                if args.eval_every > 0 && global_step > 0 && global_step.is_multiple_of(args.eval_every) {
+                if args.eval_every > 0
+                    && global_step > 0
+                    && global_step.is_multiple_of(args.eval_every)
+                {
                     let mut val_loss_sum = 0.0f64;
                     let mut val_count = 0usize;
                     for (input_ids, labels) in val_ds.batches(batch_size).take(args.eval_batches) {
@@ -483,12 +487,12 @@ fn main() -> anyhow::Result<()> {
 
                 optimizer.set_learning_rate(lr_scheduler.current_lr());
                 let mut grads = total_loss.backward()?;
-                let debug_grad_norm = if args.debug_every > 0 && global_step.is_multiple_of(args.debug_every)
-                {
-                    Some(grad_norm(&grads, &vars)?)
-                } else {
-                    None
-                };
+                let debug_grad_norm =
+                    if args.debug_every > 0 && global_step.is_multiple_of(args.debug_every) {
+                        Some(grad_norm(&grads, &vars)?)
+                    } else {
+                        None
+                    };
                 if args.grad_clip_max_norm > 0.0 {
                     clip_grad_norm(&mut grads, &vars, args.grad_clip_max_norm)?;
                 }
@@ -513,7 +517,9 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 if let Some(ref val_ds) = val_dataset {
-                    if args.eval_every > 0 && global_step > 0 && global_step.is_multiple_of(args.eval_every)
+                    if args.eval_every > 0
+                        && global_step > 0
+                        && global_step.is_multiple_of(args.eval_every)
                     {
                         let mut val_loss_sum = 0.0f64;
                         let mut val_count = 0usize;

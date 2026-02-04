@@ -51,7 +51,9 @@ onebit-llm/
 │       ├── train.rs         # Train CLI (accumulation, validation, LrScheduler)
 │       ├── export.rs        # Copy checkpoint + config to output dir
 │       ├── export_quantized.rs  # Export ternary-quantized checkpoint (bit layers → {-1,0,+1})
-│       └── run.rs           # Inference (cache, benchmark, eval-perplexity)
+│       ├── run.rs           # Inference (cache, benchmark, eval-perplexity)
+│       └── search.rs        # Expander-based quantization search CLI
+│   search/                  # Quantization search module (graph, expander, evaluator, coordinator)
 ├── data/                    # Gitignored; add tokenizer and datasets here
 ├── checkpoints/             # Gitignored; training output
 └── exported/                # Gitignored; export output
@@ -193,6 +195,24 @@ cargo run --bin export_quantized --release -- \
 
 Quantized layers (c_attn, c_proj, c_fc) are replaced with their ternary-quantized values; embeddings and norms stay F32. Inference still uses the same `run` binary (load F32 or quantized checkpoint; quantized file has fewer unique values but same layout).
 
+### Quantization Search
+
+onebit-llm supports automatic quantization configuration search using expander graph decomposition:
+
+```bash
+cargo run --release --bin search -- \
+  --model-config config.json \
+  --checkpoint checkpoints/model.safetensors \
+  --val-data data/val.txt \
+  --tokenizer tokenizer.json \
+  --max-size-mb 100 \
+  --output best_config.json
+```
+
+**Algorithm:** Based on "Deterministic Distributed Expander Decomposition" (STOC 2024): (1) construct the quantization search space as a graph, (2) decompose it into expander partitions, (3) run parallel Dijkstra search in each partition, (4) merge to find the global optimum. Complexity: O(V^(1+ε)) vs naive O(V²).
+
+**References:** Tsinghua University et al., "Deterministic Distributed Expander Decomposition", STOC 2024.
+
 ---
 
 ## Config
@@ -237,9 +257,11 @@ Defaults are in `src/config.rs`. `vocab_size` must match the tokenizer.
 - `src/binary.rs` — Binary/ternary linear layers with STE, weight scaling (γ), and optional inference cache.
 - `src/model.rs` — Decoder blocks, attention (with QK-norm), FFN, residual scaling, compression stats.
 - `src/data.rs` — Text dataset and streaming batch iterator.
+- `src/search/` — Expander-based quantization search (types, graph, expander, evaluator, coordinator).
 - `src/bin/train.rs` — Training CLI (accumulation, validation, LrScheduler).
 - `src/bin/run.rs` — Inference CLI (cache, benchmark, eval-perplexity).
 - `src/bin/export.rs` — Export CLI.
+- `src/bin/search.rs` — Quantization search CLI.
 
 ---
 

@@ -7,8 +7,10 @@ pub mod binary;
 pub mod config;
 pub mod data;
 pub mod model;
+pub mod search;
 
 pub use binary::{ternary_quantize_forward, BinaryLinear, TernaryLinear};
 pub use config::OneBitLlmConfig;
 pub use data::{batch_to_tensors, StreamingBatchIter, TextDataset};
 pub use model::{CompressionStats, OneBitLlm};
+pub use search::{QuantConfig, QuantLevel, SearchConfig, SearchCoordinator, SearchResult};
