@@ -108,6 +108,8 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    std::fs::create_dir_all(&args.output_dir)?;
+
     let mut metrics_file: Option<std::fs::File> = if val_dataset.is_some() {
         let p = args.output_dir.join("metrics.csv");
         let mut f = std::fs::File::create(&p)?;
