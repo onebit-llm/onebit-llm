@@ -1,0 +1,18 @@
+[package]
+name = "ternary-common"
+description = "Shared configuration, tokenizer wrappers, and serialization helpers"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+candle-core         = { workspace = true }
+tokenizers          = { workspace = true }
+serde               = { workspace = true }
+serde_json          = { workspace = true }
+safetensors         = { workspace = true }
+anyhow              = { workspace = true }
+memmap2             = { workspace = true }
+tracing             = { workspace = true }
