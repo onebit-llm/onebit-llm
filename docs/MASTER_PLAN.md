@@ -236,17 +236,18 @@ making the ternary distribution more balanced (fewer weights get stuck at ±1).
 
 #### 4A.3 Activation Functions
 
-**Current: ReLU²**
+**ReLU² (BitNet-style)**
 ```rust
 fn relu_squared(x: &Tensor) -> Result<Tensor> {
     x.relu()?.sqr()
 }
 ```
 
-**New: SwiGLU (to be added)**
+**SwiGLU (LLaMA/Mistral-style) — implemented in `crates/core/src/activation.rs`**
 
 SwiGLU splits the FFN intermediate dimension in half and uses one half as a
-gate. This is the activation used in LLaMA, Mistral, and most modern LLMs:
+gate. This is the activation used in LLaMA, Mistral, and most modern LLMs.
+Select via `use_swiglu: true` in config:
 
 ```rust
 /// SwiGLU Feed-Forward Network
@@ -278,9 +279,9 @@ impl SwiGLUFeedForward {
 `d_ff` (the half-size). The total parameter count becomes
 `3 × hidden_size × intermediate_size` instead of `2 × hidden_size × intermediate_size`.
 
-#### 4A.4 RMSNorm
+#### 4A.4 RMSNorm — `crates/core/src/norm.rs`
 
-Already implemented. The key property for 1-bit models: RMSNorm is
+The key property for 1-bit models: RMSNorm is
 scale-invariant, which prevents the normalisation from fighting the
 quantisation. LayerNorm subtracts the mean, which can shift weights
 across the quantisation threshold unpredictably.
@@ -292,10 +293,10 @@ across the quantisation threshold unpredictably.
 // No mean subtraction → stable with ternary weights.
 ```
 
-#### 4A.5 RoPE (Rotary Position Embeddings)
+#### 4A.5 RoPE (Rotary Position Embeddings) — `crates/core/src/attention.rs`
 
-Already implemented using `candle_nn::rotary_emb::rope_i`. No changes needed
-for the workspace migration.
+Implemented using `candle_nn::rotary_emb::rope_i`. Cosine/sine tables are
+computed per forward pass from `rope_cos_sin(device, seq_len, head_dim)`.
 
 ---
 
@@ -395,9 +396,9 @@ impl AnnealSchedule {
 }
 ```
 
-#### 4B.3 Trainer Loop Architecture
+#### 4B.3 Trainer Loop Architecture — `crates/train/src/trainer.rs`
 
-The trainer must cleanly separate three concerns:
+The trainer cleanly separates three concerns:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -420,52 +421,43 @@ The trainer must cleanly separate three concerns:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Gradient accumulation** (already implemented) is handled by running N
-micro-batches through the compute graph, scaling each loss by `1/N`,
-and calling `backward()` once on the sum. This is correct because:
+**Gradient accumulation** is handled by running N micro-batches through
+the compute graph, scaling each loss by `1/N`, and calling `backward()`
+once on the sum:
 
 ```
 ∂(L₁/N + L₂/N + ... + Lₙ/N)/∂W = (1/N) × Σᵢ ∂Lᵢ/∂W
 ```
 
-**Key change from current code:** The trainer should be a `struct Trainer`
-with builder-pattern configuration, not a 600-line `main()` function.
-This allows:
+The trainer is a `struct Trainer` (not a monolithic `main()`), enabling:
 - Unit testing the training loop with mock data
 - Embedding the trainer in a Jupyter-like notebook (via Python bindings later)
 - Running multiple training jobs with different configs in the same process
 
 ```rust
+// Actual implementation in crates/train/src/trainer.rs
 pub struct Trainer {
-    model: OneBitLlm,
+    pub model: OneBitLlm,
+    pub varmap: VarMap,
+    vars: Vec<Var>,
     optimizer: AdamW,
     lr_scheduler: LrScheduler,
     anneal_schedule: AnnealSchedule,
-    config: TrainerConfig,
-    varmap: VarMap,
-}
-
-pub struct TrainerConfig {
-    pub batch_size: usize,
-    pub accumulation_steps: usize,
-    pub max_steps: usize,
-    pub max_epochs: usize,
-    pub grad_clip_max_norm: f64,
-    pub label_smoothing: f64,
-    pub save_every: usize,
-    pub eval_every: usize,
-    pub output_dir: PathBuf,
+    pub config: TrainerConfig,
+    model_config: OneBitLlmConfig,
+    pub global_step: usize,
+    device: Device,
 }
 
 impl Trainer {
     pub fn step(&mut self, batches: &[(Vec<u32>, Vec<u32>)]) -> Result<StepMetrics> {
-        // 1. Forward + loss accumulation
+        // 1. Forward + loss accumulation (with Arenas residual)
         // 2. Backward
-        // 3. Gradient clipping
-        // 4. Optimizer step
-        // 5. Latent weight clamping
-        // 6. Advance schedules
-        // Returns: StepMetrics { loss, grad_norm, lr, anneal_frac }
+        // 3. Gradient clipping (L2 norm)
+        // 4. AdamW optimizer step
+        // 5. Latent weight clamping to [-latent_clamp_max, +latent_clamp_max]
+        // 6. Advance LR scheduler + annealing schedule
+        // Returns: StepMetrics { step, loss, lr, grad_norm }
     }
 }
 ```
@@ -675,10 +667,11 @@ pub struct BeamSearchSampler {
 }
 ```
 
-#### 4D.3 `.1bit` Binary Export Format
+#### 4D.3 `.1bit` Binary Export Format — `crates/inference/src/export.rs`
 
-For deployment on microcontrollers and C-only environments, we need a
-custom binary format that can be loaded with a single `fread()`:
+For deployment on microcontrollers and C-only environments, the `.1bit`
+binary format can be loaded with a single `fread()`. Implemented with
+`export_1bit()` and `generate_c_header()` functions:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -764,25 +757,33 @@ static inline int8_t unpack_ternary(const uint8_t* packed, size_t index) {
 Implemented in `crates/common/src/config.rs`. New fields added in v0.2:
 
 ```rust
-/// New fields for v0.2.0
+// Fields added in v0.2 (backwards-compatible via #[serde(default)])
 pub struct OneBitLlmConfig {
-    // ... existing fields ...
+    // ... core fields (vocab_size, hidden_size, num_heads, etc.) ...
 
     /// Use SwiGLU activation instead of ReLU²/SiLU.
-    /// When true, intermediate_size is the half-size (gate and up share it).
+    /// When true, FFN uses 3 projections (gate, up, down).
     #[serde(default)]
     pub use_swiglu: bool,
 
-    /// Quantisation annealing: fraction of training steps spent in soft regime.
-    /// Default 0.3 (30% of training is soft, 70% is hard).
+    /// Fraction of total training steps spent in the soft annealing
+    /// regime (tanh → sign). Default 0.3 = first 30%.
     #[serde(default = "default_anneal_fraction")]
     pub anneal_fraction: f32,
+
+    /// Arenas FP residual coefficient (None = disabled). Anneals to 0.
+    #[serde(default)]
+    pub arenas_initial: Option<f64>,
 }
 ```
 
-#### 4E.2 Data Pipeline: MmapDataset
+#### 4E.2 Data Pipeline — `crates/common/src/data.rs`
 
-For datasets larger than RAM, `memmap2` provides zero-copy access:
+Two data loading strategies are implemented:
+- **`TextDataset`** — In-memory: loads and tokenises all text files/JSONL, stores token IDs in a `Vec<u32>`. Suitable for datasets that fit in RAM.
+- **`StreamingBatchIter`** — Streaming: reads files line-by-line via `BufReader`, tokenises on the fly, and yields batches without loading everything into memory. Suitable for large datasets (25 GB+).
+
+For even larger datasets, a future **`MmapDataset`** using `memmap2` would provide zero-copy access:
 
 ```rust
 use memmap2::Mmap;
@@ -889,7 +890,7 @@ Every mathematical function must have tests:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle::{Device, Tensor};
+    use candle_core::Device;
 
     #[test]
     fn ternary_quantise_round_trip() {
@@ -898,23 +899,6 @@ mod tests {
         let q = ternary_quantize_forward(&w, true).unwrap();
         let vals: Vec<f32> = q.to_vec1().unwrap();
         assert_eq!(vals, vec![-1.0, 0.0, 0.0, 0.0, 1.0]);
-    }
-
-    #[test]
-    fn ste_gradient_flows() {
-        let device = Device::Cpu;
-        let x = Tensor::new(&[0.5f32, -0.3, 0.0], &device).unwrap();
-        // After STE sign, forward = [1, -1, 0-ish]
-        // But backward should have non-zero gradients
-        let y = ste_sign_scaled(&x, 2.0).unwrap();
-        let loss = y.sqr()?.sum_all()?;
-        let grads = loss.backward()?;
-        let grad_x = grads.get(&x).unwrap();
-        // Gradient should be 2.0 * scale = 2.0 * 2.0 for each element
-        let g: Vec<f32> = grad_x.to_vec1().unwrap();
-        for &g_i in &g {
-            assert!(g_i.abs() > 0.0, "STE gradient must be non-zero");
-        }
     }
 
     #[test]

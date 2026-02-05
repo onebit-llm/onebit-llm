@@ -23,9 +23,9 @@ Thank you for your interest in contributing. We welcome contributions from every
 3. **Make your changes.** Keep commits focused and messages clear.
 4. **Run tests and format:**
    ```bash
-   cargo test
-   cargo fmt
-   cargo clippy
+   cargo test --workspace
+   cargo fmt --all
+   cargo clippy --workspace
    ```
 5. **Push** to your fork and open a **Pull Request** against `main`. Use the PR template and reference any related issues.
 
@@ -45,9 +45,9 @@ There is no obligation to join the org to contribute; fork + PR is enough and ve
 ## Code and project guidelines
 
 - **Rust:** Follow standard Rust style. Run `cargo fmt` and fix `cargo clippy` warnings when possible.
-- **Scope:** OneBit-LLM is a 1-bit / ternary LLM in Rust using Candle. We prefer changes that fit this scope (training, inference, quantization, docs, tests).
-- **Docs:** New public APIs and non-obvious behavior should be documented. User-facing changes should be reflected in README or `docs/` when relevant.
-- **Tests:** Bug fixes are easier to merge when they add or extend tests. New features are welcome to include tests where practical.
+- **Scope:** OneBit-LLM is a 1-bit / ternary LLM framework in Rust using Candle. The workspace has five crates (`ternary-core`, `ternary-common`, `ternary-train`, `ternary-search`, `ternary-infer`). We prefer changes that fit this scope.
+- **Docs:** New public APIs and non-obvious behavior should be documented. User-facing changes should be reflected in README or `docs/MASTER_PLAN.md` when relevant.
+- **Tests:** Bug fixes are easier to merge when they add or extend tests. New features are welcome to include tests where practical. Run `cargo test --workspace` to verify.
 
 ---
 

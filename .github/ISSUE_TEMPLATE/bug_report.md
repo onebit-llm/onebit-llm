@@ -34,7 +34,8 @@ What actually happened (error message, wrong output, crash, etc.).
 ## Config / command
 
 - Config file (or relevant snippet) if applicable.
-- Exact command used (e.g. `cargo run --bin train -- ...`).
+- Exact command used (e.g. `cargo run --release -p ternary-train --bin onebit-train -- ...`).
+- Which crate is affected (core, common, train, search, inference)?
 
 ## Additional context
 

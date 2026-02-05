@@ -10,13 +10,21 @@ Brief description of the change (fix, feature, docs, etc.).
 - [ ] Refactor / cleanup
 - [ ] Other (please describe)
 
+## Crates affected
+
+- [ ] `ternary-core`
+- [ ] `ternary-common`
+- [ ] `ternary-train`
+- [ ] `ternary-search`
+- [ ] `ternary-infer`
+
 ## Checklist
 
-- [ ] `cargo test` passes
-- [ ] `cargo fmt` has been run
-- [ ] `cargo clippy` has been run (no new warnings, or justified)
-- [ ] Docs / README updated if needed
-- [ ] CHANGELOG or commit message is clear (if notable)
+- [ ] `cargo test --workspace` passes
+- [ ] `cargo fmt --all` has been run
+- [ ] `cargo clippy --workspace` has been run (no new warnings, or justified)
+- [ ] Docs / README / MASTER_PLAN.md updated if needed
+- [ ] Commit message is clear (if notable)
 
 ## Related issues
 
