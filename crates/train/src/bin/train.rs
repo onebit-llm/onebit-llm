@@ -186,10 +186,7 @@ fn main() -> anyhow::Result<()> {
                 if args.max_steps > 0 && trainer.global_step >= args.max_steps {
                     break;
                 }
-                let batches: Vec<_> = batch_iter
-                    .by_ref()
-                    .take(args.accumulation_steps)
-                    .collect();
+                let batches: Vec<_> = batch_iter.by_ref().take(args.accumulation_steps).collect();
                 if batches.is_empty() {
                     break;
                 }

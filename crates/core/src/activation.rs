@@ -127,7 +127,10 @@ impl FfnLayer {
     pub fn debug_weight_distributions(&self, prefix: &str) -> Vec<(String, Result<String>)> {
         match self {
             Self::Standard(ff) => vec![
-                (format!("{prefix}.c_fc"), ff.w_up.debug_weight_distribution()),
+                (
+                    format!("{prefix}.c_fc"),
+                    ff.w_up.debug_weight_distribution(),
+                ),
                 (
                     format!("{prefix}.c_proj"),
                     ff.w_down.debug_weight_distribution(),
@@ -138,7 +141,10 @@ impl FfnLayer {
                     format!("{prefix}.w_gate"),
                     ff.w_gate.debug_weight_distribution(),
                 ),
-                (format!("{prefix}.w_up"), ff.w_up.debug_weight_distribution()),
+                (
+                    format!("{prefix}.w_up"),
+                    ff.w_up.debug_weight_distribution(),
+                ),
                 (
                     format!("{prefix}.w_down"),
                     ff.w_down.debug_weight_distribution(),

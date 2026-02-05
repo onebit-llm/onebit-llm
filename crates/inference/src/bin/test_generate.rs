@@ -8,7 +8,10 @@ use clap::Parser;
 use ternary_infer::{InferenceRuntime, SamplerConfig};
 
 #[derive(Parser)]
-#[command(name = "onebit-test-generate", about = "Generate text from a trained model")]
+#[command(
+    name = "onebit-test-generate",
+    about = "Generate text from a trained model"
+)]
 struct Args {
     #[arg(long)]
     model_dir: PathBuf,

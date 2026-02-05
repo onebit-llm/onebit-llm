@@ -43,8 +43,10 @@ impl Sampler {
 
         // Apply repetition penalty
         if self.config.repetition_penalty != 1.0 {
-            let window_start =
-                self.recent_tokens.len().saturating_sub(self.config.repetition_window);
+            let window_start = self
+                .recent_tokens
+                .len()
+                .saturating_sub(self.config.repetition_window);
             for &tok in &self.recent_tokens[window_start..] {
                 let idx = tok as usize;
                 if idx < logits_vec.len() {
@@ -72,8 +74,7 @@ impl Sampler {
 
         // Top-k filter
         if self.config.top_k > 0 && self.config.top_k < logits_vec.len() {
-            let mut indexed: Vec<(usize, f32)> =
-                logits_vec.iter().cloned().enumerate().collect();
+            let mut indexed: Vec<(usize, f32)> = logits_vec.iter().cloned().enumerate().collect();
             indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             let threshold = indexed[self.config.top_k].1;
             for v in &mut logits_vec {
@@ -84,10 +85,7 @@ impl Sampler {
         }
 
         // Softmax
-        let max_val = logits_vec
-            .iter()
-            .cloned()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max_val = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut probs: Vec<f32> = logits_vec.iter().map(|&v| (v - max_val).exp()).collect();
         let sum: f32 = probs.iter().sum();
         if sum > 0.0 {

@@ -176,8 +176,8 @@ impl StreamingBatchIter {
                 if self.current_file_index >= self.files.len() {
                     return Ok(false);
                 }
-                let f = File::open(&self.files[self.current_file_index])
-                    .context("open next file")?;
+                let f =
+                    File::open(&self.files[self.current_file_index]).context("open next file")?;
                 self.current_reader = Some(BufReader::new(f));
                 continue;
             }

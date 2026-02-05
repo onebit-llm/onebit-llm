@@ -40,7 +40,11 @@ fn main() -> anyhow::Result<()> {
 
     eprintln!("Exporting to {} ...", args.output.display());
     let total = export_1bit(&varmap, &config, &args.output, pack_mode)?;
-    eprintln!("Done. Packed data: {} bytes ({:.2} MB)", total, total as f64 / 1024.0 / 1024.0);
+    eprintln!(
+        "Done. Packed data: {} bytes ({:.2} MB)",
+        total,
+        total as f64 / 1024.0 / 1024.0
+    );
 
     if args.emit_c_header {
         let header = generate_c_header();

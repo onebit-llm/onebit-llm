@@ -82,7 +82,10 @@ impl DecoderBlock {
         let mut out = self
             .attn
             .debug_weight_distributions(&format!("{prefix}.attn"));
-        out.extend(self.ffn.debug_weight_distributions(&format!("{prefix}.mlp")));
+        out.extend(
+            self.ffn
+                .debug_weight_distributions(&format!("{prefix}.mlp")),
+        );
         out
     }
 

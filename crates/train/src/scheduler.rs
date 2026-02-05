@@ -34,7 +34,13 @@ impl LrDecay {
 }
 
 impl LrScheduler {
-    pub fn new(lr: f64, lr_min: f64, warmup_steps: usize, max_steps: usize, decay: LrDecay) -> Self {
+    pub fn new(
+        lr: f64,
+        lr_min: f64,
+        warmup_steps: usize,
+        max_steps: usize,
+        decay: LrDecay,
+    ) -> Self {
         Self {
             step: 0,
             lr,

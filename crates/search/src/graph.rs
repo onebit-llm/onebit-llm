@@ -114,7 +114,12 @@ impl GraphBuilder {
 
     fn is_goal_config(&self, config: &QuantConfig) -> bool {
         let highly_quant = (0..self.num_layers)
-            .filter(|&i| matches!(config.get_layer(i), QuantLevel::Binary | QuantLevel::Ternary))
+            .filter(|&i| {
+                matches!(
+                    config.get_layer(i),
+                    QuantLevel::Binary | QuantLevel::Ternary
+                )
+            })
             .count();
         highly_quant >= self.num_layers * 2 / 3
     }

@@ -90,10 +90,8 @@ impl Trainer {
             trainer_config.max_steps,
             trainer_config.lr_decay,
         );
-        let anneal_schedule = AnnealSchedule::new(
-            trainer_config.max_steps,
-            model_config.anneal_fraction,
-        );
+        let anneal_schedule =
+            AnnealSchedule::new(trainer_config.max_steps, model_config.anneal_fraction);
 
         let optimizer = AdamW::new(
             vars.clone(),
@@ -158,17 +156,17 @@ impl Trainer {
         let loss_val = loss_sum / n as f32;
 
         // Backward
-        self.optimizer.set_learning_rate(self.lr_scheduler.current_lr());
+        self.optimizer
+            .set_learning_rate(self.lr_scheduler.current_lr());
         let mut grads = total_loss.backward()?;
 
         // Debug gradient norm
-        let debug_grad_norm = if self.config.debug_every > 0
-            && self.global_step % self.config.debug_every == 0
-        {
-            Some(grad_norm(&grads, &self.vars)?)
-        } else {
-            None
-        };
+        let debug_grad_norm =
+            if self.config.debug_every > 0 && self.global_step % self.config.debug_every == 0 {
+                Some(grad_norm(&grads, &self.vars)?)
+            } else {
+                None
+            };
 
         // Gradient clipping
         if self.config.grad_clip_max_norm > 0.0 {
