@@ -28,6 +28,7 @@ pub mod quantize;
 
 // ── Public re-exports ───────────────────────────────────────────────────────
 
+pub use attention::LayerKVCache;
 pub use linear::{BinaryLinear, BitLinearLayer, TernaryLinear};
 pub use model::{compression_stats, CompressionStats, OneBitLlm};
 pub use quantize::{

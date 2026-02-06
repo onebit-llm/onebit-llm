@@ -253,6 +253,10 @@ After every optimiser step, latent weights are clamped to `[-latent_clamp_max, +
 (default 1.5). This keeps them within reach of the quantisation thresholds so
 they can still flip between {-1, 0, +1} as the model learns.
 
+### KV-Cache (O(1) per-token decoding)
+
+During generation, the inference runtime uses a per-layer key/value cache. The prompt is run once (prefill); then each new token is decoded with sequence length 1, reusing the cache. This gives O(1) work per token instead of reprocessing the full context every step.
+
 ### `.1bit` Binary Export
 
 Trained models can be exported to a compact `.1bit` format:
@@ -341,7 +345,7 @@ Generation was tested with `onebit-test-generate` (temperature 0.7, top-k 40, to
 - [x] Inference sampler: top-k, top-p, temperature, repetition penalty
 - [x] `.1bit` binary export format with C-compatible header
 - [x] End-to-end train -> checkpoint -> inference pipeline verified on GPU
-- [ ] KV-Cache for O(1) per-token decoding
+- [x] KV-Cache for O(1) per-token decoding
 - [ ] `memmap2` zero-copy dataset loading (`MmapDataset`)
 - [ ] `tokio`-based async search coordinator
 - [ ] WASM compilation target

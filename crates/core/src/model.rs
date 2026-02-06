@@ -10,7 +10,7 @@ use candle_nn::{embedding, Embedding, Module, VarBuilder};
 use ternary_common::OneBitLlmConfig;
 
 use crate::activation::FfnLayer;
-use crate::attention::CausalSelfAttention;
+use crate::attention::{CausalSelfAttention, LayerKVCache};
 use crate::norm::NormLayer;
 
 // ── Decoder Block ───────────────────────────────────────────────────────────
@@ -50,12 +50,21 @@ impl DecoderBlock {
     }
 
     fn forward(&self, x: &Tensor, arenas_coef: Option<f32>) -> Result<Tensor> {
+        self.forward_with_cache(x, arenas_coef, None)
+    }
+
+    fn forward_with_cache(
+        &self,
+        x: &Tensor,
+        arenas_coef: Option<f32>,
+        cache: Option<&mut LayerKVCache>,
+    ) -> Result<Tensor> {
         let block_input = x;
 
         // Attention sub-layer
         let residual = x;
         let normed = self.ln1.forward(x)?;
-        let attn_out = self.attn.forward(&normed)?;
+        let attn_out = self.attn.forward_with_cache(&normed, cache)?;
         let scaled = attn_out.affine(self.residual_scale, 0.0)?;
         let mut x = (residual + scaled)?;
         if let Some(c) = arenas_coef {
@@ -144,13 +153,45 @@ impl OneBitLlm {
         input_ids: &Tensor,
         arenas_coef: Option<f32>,
     ) -> Result<Tensor> {
+        self.forward_with_cache(input_ids, arenas_coef, None)
+    }
+
+    /// Forward with optional KV cache for O(1) per-token decoding.
+    ///
+    /// - `cache == None`: full forward (training or one-shot).
+    /// - `cache == Some(&mut vec)` with empty layers: prefill; run full sequence and fill cache.
+    /// - `cache == Some(&mut vec)` with non-empty: decode step; input_ids must have seq_len 1.
+    ///
+    /// The slice must have length `config.num_layers`.
+    pub fn forward_with_cache(
+        &self,
+        input_ids: &Tensor,
+        arenas_coef: Option<f32>,
+        cache: Option<&mut [LayerKVCache]>,
+    ) -> Result<Tensor> {
         let mut x = self.wte.forward(input_ids)?;
-        for block in &self.blocks {
-            x = block.forward(&x, arenas_coef)?;
+        let num_blocks = self.blocks.len();
+        match cache {
+            None => {
+                for block in &self.blocks {
+                    x = block.forward(&x, arenas_coef)?;
+                }
+            }
+            Some(caches) => {
+                if caches.len() != num_blocks {
+                    return Err(candle_core::Error::Msg(format!(
+                        "KV cache length {} does not match num_layers {}",
+                        caches.len(),
+                        num_blocks
+                    )));
+                }
+                for (block, layer_cache) in self.blocks.iter().zip(caches.iter_mut()) {
+                    x = block.forward_with_cache(&x, arenas_coef, Some(layer_cache))?;
+                }
+            }
         }
         x = self.ln_f.forward(&x)?;
 
-        // Weight-tied output projection: logits = x @ wte^T
         let wte_weight = self.wte.embeddings();
         let (b, t, h) = x.dims3()?;
         let x_2d = x.reshape((b * t, h))?;
