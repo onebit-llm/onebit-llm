@@ -276,6 +276,42 @@ wget https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-103-raw-v1.
 unzip wikitext-103-raw-v1.zip -d data/
 ```
 
+For WikiText-2, a small Python script is provided to download and format data plus the GPT-2 tokenizer: see `scripts/download_wikitext.py`. It writes `data/wikitext-2/train.txt`, `valid.txt`, `test.txt` and `data/tokenizer.json`.
+
+---
+
+## Experimental results (WikiText-2)
+
+The following describes a real training and inference run on WikiText-2. **This model is not ready for production or general use.** Results are documented for reproducibility and to set accurate expectations.
+
+### Hardware
+
+- **GPU:** NVIDIA RTX 4080 (16 GB VRAM)
+- Training and inference were run on this single GPU.
+
+### Settings
+
+- **Config:** `config_wikitext.json` — binary 1-bit (no ternary), 512 hidden size, 8 layers, 8 heads, 1536 intermediate size, **max_seq_len 256** (reduced from 512 to avoid OOM). RMSNorm, RoPE, QK-norm, residual scaling, and dynamic threshold enabled. `ste_scale_factor` 1.0, `latent_clamp_max` 1.5, `anneal_fraction` 0.2, `arenas_initial` 0.1, `arenas_anneal_steps` 5000.
+- **Data:** WikiText-2 via `scripts/download_wikitext.py` — train ~998 paragraphs (~413K tokens), validation 176 paragraphs; GPT-2 tokenizer (`data/tokenizer.json`).
+- **Training:** AdamW, lr 1e-3, cosine decay to 1e-5, warmup 500 steps, batch_size 2, accumulation_steps 4 (effective batch 8), grad_clip_max_norm 1.0, label_smoothing 0.05. **50,000 steps** with streaming over `data/wikitext-2/`, saving checkpoints every 10K steps and the final model to `checkpoints/wikitext/`.
+
+### Training results
+
+| Step   | Train loss | Val loss | Notes                    |
+|--------|------------|----------|--------------------------|
+| 5,000  | ~11        | —        | Early checkpoint         |
+| 20,000 | ~9.5       | ~26.6    | Mid training             |
+| 50,000 | **8.07**   | **25.15**| Final run (completed)    |
+
+Validation perplexity at 50K steps was very high (~8.4e10), indicating the model has not learned to predict text reliably.
+
+### Inference results
+
+Generation was tested with `onebit-test-generate` (temperature 0.7, top-k 40, top-p 0.9, repetition penalty 1.4) on prompts such as *"The history of"*, *"The rain fell"*, *"A small boat"*, *"The scientist"*, *"Stars twinkled"*.
+
+- **Observed behaviour:** The model sometimes produces plausible short beginnings (e.g. *"The history of"*, *"The rain fell"*) and WikiText-style fragments (names, places, numbers), but output quickly degrades into word salad, list-like tokens, and severe repetition (e.g. repeated words or subwords). It has not learned coherent sentence structure or long-range fluency.
+- **Conclusion:** The 1-bit model has captured local token and phrase statistics to some degree but is **not suitable for use** as a language model in its current form. Further work (more/better data, longer training, architecture or inference tuning) would be needed to approach usable quality.
+
 ---
 
 ## Documentation
