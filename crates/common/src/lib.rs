@@ -4,11 +4,15 @@
 //!
 //! * **[`OneBitLlmConfig`]** — model hyper-parameters (serialised as JSON).
 //! * **[`FfnActivation`]** — resolved FFN activation choice.
-//! * **[`TextDataset`]** / **[`StreamingBatchIter`]** — data loading & batching.
-//! * **[`batch_to_tensors`]** — raw batch → Candle tensors.
+//! * **[`TextDataset`]** / **[`StreamingBatchIter`]** / **[`MmapDataset`]** — data loading & batching.
+//! * **[`BatchDataset`]** — common trait for in-memory and mmap datasets.
+//! * **[`batch_to_tensors`]** / **[`write_tokenized_file`]** — raw batch → tensors; save tokenized.
 
 pub mod config;
 pub mod data;
 
 pub use config::{FfnActivation, OneBitLlmConfig};
-pub use data::{batch_to_tensors, StreamingBatchIter, TextDataset};
+pub use data::{
+    batch_to_tensors, write_tokenized_file, AnyBatchDataset, BatchDataset, MmapDataset,
+    StreamingBatchIter, TextDataset,
+};

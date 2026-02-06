@@ -1,7 +1,7 @@
 # OneBit-LLM — Master Plan
 
 > **Version:** 0.2.0  
-> **Status:** Implemented -- workspace migration complete, end-to-end pipeline verified  
+> **Status:** Implemented — workspace migration complete; KV-cache, MmapDataset, and tokio async search coordinator added  
 > **Audience:** Contributors, reviewers, and the future you at 3 AM debugging gradient death
 
 ---
@@ -506,7 +506,8 @@ For N=6 this is trivial (64 configs), but for N=32 or N=80 it's intractable.
 │                                                      │
 │  1. Build QuantGraph (nodes=configs, edges=transitions)
 │  2. Expander decompose → partitions                  │
-│  3. For each partition (SEQUENTIAL — one GPU):       │
+│  3. For each partition (search_async uses            │
+│     │   spawn_blocking for the partition loop):      │
 │     ├── Run Dijkstra from start_node                 │
 │     ├── For top-K reachable nodes:                   │
 │     │   └── Evaluator.evaluate(config)               │
@@ -514,8 +515,8 @@ For N=6 this is trivial (64 configs), but for N=32 or N=80 it's intractable.
 │  4. Merge partition results → global best            │
 │  5. Final evaluation of global best                  │
 │                                                      │
-│  ⚠ Sequential search prevents GPU OOM!              │
-│  ⚠ Each evaluate() loads full model into VRAM.      │
+│  Use search_async() from tokio to avoid blocking     │
+│  the runtime. Sequential eval prevents GPU OOM.       │
 └────────────────────────────────────────────────────┘
 ```
 
@@ -534,113 +535,29 @@ Binary while keeping everything else Ternary, measure the loss increase.
 Layers with high sensitivity should stay Ternary; layers with low sensitivity
 can be safely compressed to Binary.
 
-#### 4C.4 Future: Async Coordinator with Tokio
+#### 4C.4 Async Coordinator with Tokio — Implemented
 
-The current coordinator is synchronous. For multi-GPU search, we need
-an async coordinator that can dispatch evaluation tasks to different
-GPU workers:
+The coordinator exposes both synchronous and async APIs:
 
-```rust
-/// Future architecture (not yet implemented)
-pub struct AsyncSearchCoordinator {
-    workers: Vec<tokio::sync::mpsc::Sender<EvalRequest>>,
-    results: tokio::sync::mpsc::Receiver<EvalResult>,
-}
-```
+- **`search()`** — Runs the full search on the current thread (blocking).
+- **`search_async()`** — Runs the same search inside `tokio::task::spawn_blocking`, so the async runtime is not blocked by GPU evaluation. Use from async code (e.g. `#[tokio::main]`) for cancellation and composition with other async tasks.
+
+The `onebit-search` CLI uses `#[tokio::main]` and `coordinator.search_async().await`. Partition evaluation (Dijkstra + `ConfigEvaluator::evaluate`) remains single-threaded per process to avoid GPU OOM; the async wrapper keeps the runtime responsive.
 
 ---
 
 ### 4D. `crates/inference` — The Deployment Engine
 
-#### 4D.1 KV-Cache
+#### 4D.1 KV-Cache — Implemented
 
-The current inference runtime recomputes the full attention over all past
-tokens for every new token. This is O(n^2) per generation. A future
-KV-Cache implementation will bring this to O(n) per token:
+Inference uses a **KV-cache** for O(1) work per token after prefill. Implemented in `crates/core` and `crates/inference`:
 
-```rust
-/// Pre-allocated KV-Cache for a single attention layer.
-///
-/// Shape: (batch, num_heads, max_seq_len, head_dim)
-///
-/// The cache is a ring buffer: when the sequence exceeds max_seq_len,
-/// we slide the window forward (or truncate the oldest entries).
-pub struct KvCache {
-    k: Tensor,   // (batch, heads, max_seq, head_dim)
-    v: Tensor,   // (batch, heads, max_seq, head_dim)
-    len: usize,  // Current number of cached positions
-    max_len: usize,
-}
+- **`LayerKVCache`** (`crates/core/src/attention.rs`) — Per-layer cache holding optional key/value tensors `(batch, num_heads, seq_len, head_dim)`. Methods: `len()`, `is_empty()`, `append(k, v)`, `key()`, `value()`, `clear()`.
+- **`CausalSelfAttention::forward_with_cache(x, cache)`** — If `cache` is `Some` and empty: prefill (full sequence, fill cache). If `cache` is `Some` and non-empty: decode step (single token, append K/V to cache, attend over cache). RoPE uses `rope_cos_sin_range` for the decode position.
+- **`OneBitLlm::forward_with_cache(input_ids, arenas_coef, cache)`** — Accepts `Option<&mut [LayerKVCache]>`; each block passes its layer cache to attention.
+- **`InferenceRuntime::generate()`** — Prefills once (prompt up to `max_seq_len`), fills the KV cache, then decodes one token at a time with `forward_with_cache` and the cache. No full-context recomputation per token.
 
-impl KvCache {
-    /// Create empty cache on the given device.
-    pub fn new(
-        batch: usize,
-        heads: usize,
-        max_len: usize,
-        head_dim: usize,
-        device: &Device,
-    ) -> Result<Self> {
-        let k = Tensor::zeros((batch, heads, max_len, head_dim), DType::F32, device)?;
-        let v = Tensor::zeros((batch, heads, max_len, head_dim), DType::F32, device)?;
-        Ok(Self { k, v, len: 0, max_len })
-    }
-
-    /// Append new K, V for the current position(s).
-    /// Returns the full K, V tensors up to current length.
-    pub fn append(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<(Tensor, Tensor)> {
-        let new_len = new_k.dim(2)?;  // number of new positions
-
-        // Write into the pre-allocated buffer at position [self.len .. self.len + new_len]
-        // (Implementation uses narrow + copy or slice_assign)
-        self.len += new_len;
-
-        // Return view of cache up to current length
-        let k_out = self.k.narrow(2, 0, self.len)?;
-        let v_out = self.v.narrow(2, 0, self.len)?;
-        Ok((k_out, v_out))
-    }
-
-    /// Reset the cache (new conversation).
-    pub fn reset(&mut self) {
-        self.len = 0;
-    }
-}
-```
-
-**Integration with attention:**
-
-```rust
-/// Modified attention forward for incremental decoding.
-///
-/// When kv_cache is Some, x contains only the NEW tokens.
-/// The cache provides all previous K, V values.
-pub fn forward_incremental(
-    &self,
-    x: &Tensor,                      // (batch, new_seq, hidden)
-    kv_cache: &mut Option<KvCache>,
-) -> Result<Tensor> {
-    let (b, t, _) = x.dims3()?;
-
-    // Project Q, K, V for the NEW tokens only
-    let qkv = self.c_attn.forward(x)?;
-    // ... reshape, split into q, k, v ...
-
-    // Append to cache and get full history
-    let (k_full, v_full) = if let Some(cache) = kv_cache {
-        cache.append(&k, &v)?
-    } else {
-        (k.clone(), v.clone())
-    };
-
-    // Attention: Q (new tokens) attends to K_full, V_full (all tokens)
-    let scores = q.matmul(&k_full.t()?)? * self.scale;
-    // ... causal mask (offset by cache length) ...
-    let att = softmax(&scores, D::Minus1)?;
-    let y = att.matmul(&v_full)?;
-    // ...
-}
-```
+The cache is created and cleared at the start of each `generate()` call; prefill and decode share the same `forward_with_cache` API.
 
 #### 4D.2 Decoding Strategies
 
@@ -779,47 +696,13 @@ pub struct OneBitLlmConfig {
 
 #### 4E.2 Data Pipeline — `crates/common/src/data.rs`
 
-Two data loading strategies are implemented:
-- **`TextDataset`** — In-memory: loads and tokenises all text files/JSONL, stores token IDs in a `Vec<u32>`. Suitable for datasets that fit in RAM.
+Three data loading strategies are implemented:
+
+- **`TextDataset`** — In-memory: loads and tokenises all text files/JSONL, stores token IDs in a `Vec<u32>`. Suitable for datasets that fit in RAM. Exposes **`write_tokenized(path)`** to save token IDs in the binary format used by `MmapDataset`.
 - **`StreamingBatchIter`** — Streaming: reads files line-by-line via `BufReader`, tokenises on the fly, and yields batches without loading everything into memory. Suitable for large datasets (25 GB+).
+- **`MmapDataset`** — Zero-copy: memory-maps a pre-tokenised binary file (created by `write_tokenized_file` or `TextDataset::write_tokenized`). Format: magic `"TKN2"` (4 bytes), `num_tokens` u64 LE (8 bytes), then `num_tokens` × u32 LE. **`MmapDataset::open(path, seq_len)`** parses the header and exposes **`num_tokens()`**, **`num_sequences()`**, and **`batches(batch_size)`** by reading u32s from the mmap (only touched pages are paged in). The **`onebit-tokenize`** binary creates `.tokens` files from a text data dir; the train CLI uses `MmapDataset` automatically when `--data-dir` points at a `.tokens` file.
 
-For even larger datasets, a future **`MmapDataset`** using `memmap2` would provide zero-copy access:
-
-```rust
-use memmap2::Mmap;
-
-/// Memory-mapped dataset: pre-tokenised binary file.
-///
-/// File format: flat array of u32 token IDs, little-endian.
-/// Created by a one-time preprocessing step:
-///   tokenise(text) → Vec<u32> → write_to_file()
-///
-/// At training time, the OS pages in only the data we actually read.
-/// A 38 GB dataset uses ~0 MB of heap.
-pub struct MmapDataset {
-    mmap: Mmap,
-    len: usize,   // number of u32 tokens
-    seq_len: usize,
-}
-
-impl MmapDataset {
-    pub fn open(path: &Path, seq_len: usize) -> anyhow::Result<Self> {
-        let file = std::fs::File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        let len = mmap.len() / 4;  // u32 = 4 bytes
-        Ok(Self { mmap, len, seq_len })
-    }
-
-    /// Get a contiguous slice of tokens starting at byte offset.
-    pub fn get_tokens(&self, start: usize, count: usize) -> &[u32] {
-        let byte_start = start * 4;
-        let byte_end = byte_start + count * 4;
-        let bytes = &self.mmap[byte_start..byte_end];
-        // SAFETY: mmap is aligned, u32 is 4-byte aligned, we checked bounds
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u32, count) }
-    }
-}
-```
+**`BatchDataset`** is a trait implemented by both `TextDataset` and `MmapDataset` (and **`AnyBatchDataset`** wraps either). The trainer’s **`evaluate(&impl BatchDataset)`** and the train CLI support both in-memory and mmap validation data.
 
 ---
 
@@ -870,10 +753,10 @@ The migration from monolith to workspace is done in phases:
 - [x] Inference generates recognisable fragments from training data
 - [x] Full test suite: 18 tests passing, zero warnings
 
-### Phase 7: Future Work
-- [ ] KV-Cache for O(1) per-token decoding
-- [ ] `MmapDataset` in `ternary-common`
-- [ ] `tokio`-based async search coordinator
+### Phase 7: Roadmap (completed and remaining)
+- [x] KV-Cache for O(1) per-token decoding — `LayerKVCache`, `forward_with_cache` in core/inference
+- [x] `MmapDataset` in `ternary-common` — binary format TKN2, `write_tokenized_file`, `onebit-tokenize`, train CLI auto-detects `.tokens`
+- [x] `tokio`-based async search coordinator — `SearchCoordinator::search_async()`, `onebit-search` uses `#[tokio::main]`
 - [ ] WASM build target with example web page
 - [ ] Hugging Face model hub integration
 - [ ] Speculative decoding with tiny draft model
@@ -989,6 +872,17 @@ Pareto-optimal configurations.
 Use a tiny 1-bit "draft" model to propose K tokens, then verify with a
 larger model in parallel. Since 1-bit models are extremely fast for
 inference, this could provide 3-5× speedup on the verification model.
+
+### 7.5 Faster SSSP in quantisation search (optional)
+
+The search coordinator uses Dijkstra per partition to get shortest-path
+costs to config nodes. If the quantisation graph grows large, the
+shortest-path step could be sped up by using a faster SSSP algorithm.
+arXiv:2504.17033 gives a deterministic \(O(m \log^{2/3} n)\)-time algorithm
+for directed SSSP (breaking the \(O(m + n \log n)\) sorting barrier); see
+[docs/ARXIV_2504.17033_REVIEW.md](ARXIV_2504.17033_REVIEW.md) for a short
+review and applicability to our search. Current bottleneck is GPU
+evaluation, so this is deferred until the graph scale justifies it.
 
 ---
 

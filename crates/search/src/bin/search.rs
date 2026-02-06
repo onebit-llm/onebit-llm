@@ -1,4 +1,4 @@
-//! Quantisation search CLI.
+//! Quantisation search CLI (tokio-based async coordinator).
 
 use clap::Parser;
 use ternary_search::{SearchConfig, SearchCoordinator};
@@ -30,7 +30,8 @@ struct Args {
     output: String,
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
@@ -57,7 +58,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     let coordinator = SearchCoordinator::new(search_config)?;
-    let result = coordinator.search()?;
+    let result = coordinator.search_async().await?;
 
     let json = serde_json::to_string_pretty(&result)?;
     std::fs::write(&args.output, json)?;

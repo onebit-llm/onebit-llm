@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use candle_core::Device;
 use clap::Parser;
 
-use ternary_common::{OneBitLlmConfig, StreamingBatchIter, TextDataset};
+use ternary_common::{AnyBatchDataset, BatchDataset, OneBitLlmConfig, StreamingBatchIter, TextDataset};
 use ternary_train::{LrDecay, Trainer, TrainerConfig};
 
 #[derive(Parser, Debug)]
@@ -98,12 +98,19 @@ fn main() -> anyhow::Result<()> {
     let device = Device::cuda_if_available(0)?;
     let mut trainer = Trainer::new(model_config.clone(), trainer_config, device)?;
 
-    // Validation dataset (optional)
-    let val_dataset: Option<TextDataset> = if let Some(ref p) = args.val_data_dir {
-        let mut ds = TextDataset::new(p, &args.tokenizer, model_config.max_seq_len)?;
-        ds.load()?;
-        eprintln!("Validation: {} sequences", ds.num_sequences());
-        Some(ds)
+    // Validation dataset (optional): text dir/file or pre-tokenized .tokens file
+    let val_dataset: Option<AnyBatchDataset> = if let Some(ref p) = args.val_data_dir {
+        let seq_len = model_config.max_seq_len;
+        if p.is_file() && p.extension().map(|e| e == "tokens").unwrap_or(false) {
+            let ds = ternary_common::MmapDataset::open(p, seq_len)?;
+            eprintln!("Validation (mmap): {} sequences", ds.num_sequences());
+            Some(AnyBatchDataset::Mmap(ds))
+        } else {
+            let mut ds = TextDataset::new(p, &args.tokenizer, seq_len)?;
+            ds.load()?;
+            eprintln!("Validation: {} sequences", ds.num_sequences());
+            Some(AnyBatchDataset::Text(ds))
+        }
     } else {
         None
     };
@@ -155,14 +162,30 @@ fn main() -> anyhow::Result<()> {
             run_eval_and_checkpoint(&trainer, &val_dataset, &mut metrics_file, &args)?;
         }
     } else {
-        let mut dataset =
-            TextDataset::new(&args.data_dir, &args.tokenizer, model_config.max_seq_len)?;
-        dataset.load()?;
-        eprintln!(
-            "Loaded {} tokens, {} sequences",
-            dataset.num_tokens(),
-            dataset.num_sequences()
-        );
+        let seq_len = model_config.max_seq_len;
+        let dataset: AnyBatchDataset = if args.data_dir.is_file()
+            && args.data_dir.extension().map(|e| e == "tokens").unwrap_or(false)
+        {
+            eprintln!("Using mmap dataset: {}", args.data_dir.display());
+            let ds = ternary_common::MmapDataset::open(&args.data_dir, seq_len)?;
+            eprintln!(
+                "Loaded {} tokens, {} sequences (zero-copy)",
+                ds.num_tokens(),
+                ds.num_sequences()
+            );
+            AnyBatchDataset::Mmap(ds)
+        } else {
+            let mut ds =
+                TextDataset::new(&args.data_dir, &args.tokenizer, seq_len)?;
+            ds.load()?;
+            eprintln!(
+                "Loaded {} tokens, {} sequences",
+                ds.num_tokens(),
+                ds.num_sequences()
+            );
+            AnyBatchDataset::Text(ds)
+        };
+
         if dataset.num_sequences() == 0 {
             anyhow::bail!("No sequences; need at least seq_len+1 tokens");
         }
@@ -218,7 +241,7 @@ fn main() -> anyhow::Result<()> {
 
 fn run_eval_and_checkpoint(
     trainer: &Trainer,
-    val_dataset: &Option<TextDataset>,
+    val_dataset: &Option<AnyBatchDataset>,
     metrics_file: &mut Option<std::fs::File>,
     args: &Args,
 ) -> anyhow::Result<()> {

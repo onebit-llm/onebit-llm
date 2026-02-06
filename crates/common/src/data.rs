@@ -4,15 +4,40 @@
 //! from `tokenizer.json` (e.g. GPT-2 BPE). Batches are `(batch_size, seq_len)`
 //! token IDs; labels for next-token prediction are `input_ids` shifted by one.
 //!
-//! Use [`StreamingBatchIter`] for large datasets without loading all into RAM.
+//! * **[`TextDataset`]** — load and tokenise text into memory; call [`TextDataset::batches`].
+//! * **[`StreamingBatchIter`]** — stream over files without loading all into RAM.
+//! * **[`MmapDataset`]** — zero-copy access to a pre-tokenised binary file via `memmap2`.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result as AnyhowResult};
 use candle_core::{Device, Result, Tensor};
+use memmap2::Mmap;
 use tokenizers::Tokenizer;
+
+// ── Tokenized binary format ──────────────────────────────────────────────────
+
+/// Magic bytes for the tokenized binary format (version 2).
+const TOKENIZED_MAGIC: &[u8; 4] = b"TKN2";
+/// Header size: magic (4) + num_tokens (8).
+const TOKENIZED_HEADER_LEN: usize = 4 + 8;
+
+/// Write a pre-tokenised sequence to a binary file for use with [`MmapDataset`].
+///
+/// Format: magic "TKN2" (4 bytes), `num_tokens` as u64 LE (8 bytes), then
+/// `num_tokens` × u32 LE. No other metadata; use the same `seq_len` when opening.
+pub fn write_tokenized_file(path: &Path, token_ids: &[u32]) -> AnyhowResult<()> {
+    let mut f = File::create(path).context("create tokenized file")?;
+    f.write_all(TOKENIZED_MAGIC)?;
+    f.write_all(&(token_ids.len() as u64).to_le_bytes())?;
+    for &id in token_ids {
+        f.write_all(&id.to_le_bytes())?;
+    }
+    f.sync_all().context("sync tokenized file")?;
+    Ok(())
+}
 
 // ── TextDataset (in-memory) ─────────────────────────────────────────────────
 
@@ -89,6 +114,11 @@ impl TextDataset {
         } else {
             self.token_ids.len().saturating_sub(1) / self.seq_len
         }
+    }
+
+    /// Write tokenised data to a binary file for use with [`MmapDataset`].
+    pub fn write_tokenized(&self, path: &Path) -> AnyhowResult<()> {
+        write_tokenized_file(path, &self.token_ids)
     }
 
     /// Yield `(input_ids, labels)` batches. Labels are shifted by 1.
@@ -218,6 +248,167 @@ impl StreamingBatchIter {
         }
         self.buffer.drain(0..(batch_size * (seq_len + 1)));
         Ok(Some((input_batch, label_batch)))
+    }
+}
+
+// ── MmapDataset (zero-copy) ──────────────────────────────────────────────────
+
+/// Zero-copy dataset over a pre-tokenised binary file.
+///
+/// The file is memory-mapped; only the pages touched for each batch are paged in.
+/// Use [`write_tokenized_file`] or [`TextDataset::write_tokenized`] to create the file.
+pub struct MmapDataset {
+    mmap: Mmap,
+    num_tokens: usize,
+    seq_len: usize,
+}
+
+impl MmapDataset {
+    /// Open a tokenized binary file. `seq_len` must match the sequence length used in training.
+    pub fn open(path: &Path, seq_len: usize) -> AnyhowResult<Self> {
+        let file = File::open(path).context("open tokenized file for mmap")?;
+        let mmap = unsafe { Mmap::map(&file).context("mmap tokenized file")? };
+        if mmap.len() < TOKENIZED_HEADER_LEN {
+            anyhow::bail!("tokenized file too short");
+        }
+        if &mmap[0..4] != TOKENIZED_MAGIC {
+            anyhow::bail!("invalid tokenized file: bad magic");
+        }
+        let num_tokens = u64::from_le_bytes(mmap[4..12].try_into().unwrap()) as usize;
+        let expected_len = TOKENIZED_HEADER_LEN + num_tokens * 4;
+        if mmap.len() < expected_len {
+            anyhow::bail!(
+                "tokenized file truncated: expected {} bytes, got {}",
+                expected_len,
+                mmap.len()
+            );
+        }
+        Ok(Self {
+            mmap,
+            num_tokens,
+            seq_len,
+        })
+    }
+
+    pub fn num_tokens(&self) -> usize {
+        self.num_tokens
+    }
+
+    pub fn num_sequences(&self) -> usize {
+        if self.seq_len == 0 {
+            0
+        } else {
+            self.num_tokens.saturating_sub(1) / self.seq_len
+        }
+    }
+
+    /// Read one u32 at byte offset (after header).
+    #[inline]
+    fn read_u32_at(&self, byte_offset: usize) -> u32 {
+        let i = TOKENIZED_HEADER_LEN + byte_offset;
+        u32::from_le_bytes(self.mmap[i..i + 4].try_into().unwrap())
+    }
+
+    /// Yield `(input_ids, labels)` batches by reading from the mmap. Labels are shifted by 1.
+    pub fn batches(
+        &self,
+        batch_size: usize,
+    ) -> impl Iterator<Item = (Vec<u32>, Vec<u32>)> + '_ {
+        let seq_len = self.seq_len;
+        let step = seq_len;
+        let total = self.num_tokens;
+        let mut start = 0usize;
+        let dataset = self;
+        std::iter::from_fn(move || {
+            if start + batch_size * seq_len + 1 > total {
+                return None;
+            }
+            let mut input_batch = Vec::with_capacity(batch_size * seq_len);
+            let mut label_batch = Vec::with_capacity(batch_size * seq_len);
+            for b in 0..batch_size {
+                let base = start + b * step;
+                for i in 0..seq_len {
+                    let input_byte = (base + i) * 4;
+                    let label_byte = (base + i + 1) * 4;
+                    input_batch.push(dataset.read_u32_at(input_byte));
+                    label_batch.push(dataset.read_u32_at(label_byte));
+                }
+            }
+            start += batch_size * step;
+            Some((input_batch, label_batch))
+        })
+    }
+}
+
+// ── BatchDataset trait ──────────────────────────────────────────────────────
+
+/// Common interface for datasets that yield (input_ids, labels) batches.
+pub trait BatchDataset {
+    fn num_tokens(&self) -> usize;
+    fn num_sequences(&self) -> usize;
+    fn batches(
+        &self,
+        batch_size: usize,
+    ) -> Box<dyn Iterator<Item = (Vec<u32>, Vec<u32>)> + '_>;
+}
+
+impl BatchDataset for TextDataset {
+    fn num_tokens(&self) -> usize {
+        self.num_tokens()
+    }
+    fn num_sequences(&self) -> usize {
+        self.num_sequences()
+    }
+    fn batches(
+        &self,
+        batch_size: usize,
+    ) -> Box<dyn Iterator<Item = (Vec<u32>, Vec<u32>)> + '_> {
+        Box::new(self.batches(batch_size))
+    }
+}
+
+impl BatchDataset for MmapDataset {
+    fn num_tokens(&self) -> usize {
+        self.num_tokens()
+    }
+    fn num_sequences(&self) -> usize {
+        self.num_sequences()
+    }
+    fn batches(
+        &self,
+        batch_size: usize,
+    ) -> Box<dyn Iterator<Item = (Vec<u32>, Vec<u32>)> + '_> {
+        Box::new(self.batches(batch_size))
+    }
+}
+
+/// Either a [`TextDataset`] or an [`MmapDataset`], both implementing [`BatchDataset`].
+pub enum AnyBatchDataset {
+    Text(TextDataset),
+    Mmap(MmapDataset),
+}
+
+impl BatchDataset for AnyBatchDataset {
+    fn num_tokens(&self) -> usize {
+        match self {
+            AnyBatchDataset::Text(d) => d.num_tokens(),
+            AnyBatchDataset::Mmap(d) => d.num_tokens(),
+        }
+    }
+    fn num_sequences(&self) -> usize {
+        match self {
+            AnyBatchDataset::Text(d) => d.num_sequences(),
+            AnyBatchDataset::Mmap(d) => d.num_sequences(),
+        }
+    }
+    fn batches(
+        &self,
+        batch_size: usize,
+    ) -> Box<dyn Iterator<Item = (Vec<u32>, Vec<u32>)> + '_> {
+        match self {
+            AnyBatchDataset::Text(d) => Box::new(d.batches(batch_size)),
+            AnyBatchDataset::Mmap(d) => Box::new(d.batches(batch_size)),
+        }
     }
 }
 

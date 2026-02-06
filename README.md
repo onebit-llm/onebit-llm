@@ -282,6 +282,26 @@ unzip wikitext-103-raw-v1.zip -d data/
 
 For WikiText-2, a small Python script is provided to download and format data plus the GPT-2 tokenizer: see `scripts/download_wikitext.py`. It writes `data/wikitext-2/train.txt`, `valid.txt`, `test.txt` and `data/tokenizer.json`.
 
+### Zero-copy with MmapDataset
+
+For large datasets, avoid loading all tokens into RAM by using a pre-tokenized binary file and **MmapDataset** (backed by `memmap2`). Only the pages touched for each batch are paged in.
+
+1. **Create a `.tokens` file** (one-off): load text, tokenize, and write the binary format:
+   ```bash
+   cargo run -p ternary-train --bin onebit-tokenize -- \
+     --data-dir data/wikitext-2 --tokenizer data/tokenizer.json \
+     --seq-len 256 --output data/wikitext-2/train.tokens
+   ```
+   Or from code: `TextDataset::load()` then `dataset.write_tokenized("path/to/train.tokens")`.
+
+2. **Train with mmap**: point `--data-dir` at the `.tokens` file. The trainer detects the extension and uses `MmapDataset` automatically:
+   ```bash
+   cargo run -p ternary-train --bin onebit-train --features cuda -- \
+     --config config_wikitext.json --data-dir data/wikitext-2/train.tokens \
+     --tokenizer data/tokenizer.json --output-dir checkpoints/wikitext ...
+   ```
+   Validation can use a `.tokens` file too: `--val-data-dir data/wikitext-2/valid.tokens`.
+
 ---
 
 ## Experimental results (WikiText-2)
@@ -346,8 +366,8 @@ Generation was tested with `onebit-test-generate` (temperature 0.7, top-k 40, to
 - [x] `.1bit` binary export format with C-compatible header
 - [x] End-to-end train -> checkpoint -> inference pipeline verified on GPU
 - [x] KV-Cache for O(1) per-token decoding
-- [ ] `memmap2` zero-copy dataset loading (`MmapDataset`)
-- [ ] `tokio`-based async search coordinator
+- [x] `memmap2` zero-copy dataset loading (`MmapDataset`)
+- [x] `tokio`-based async search coordinator
 - [ ] WASM compilation target
 - [ ] `no_std` core support for embedded
 - [ ] Hugging Face model hub integration

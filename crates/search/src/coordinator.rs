@@ -1,4 +1,8 @@
 //! Main search coordinator (combines all components).
+//!
+//! Supports both synchronous [`search`](Self::search) and tokio-based async
+//! [`search_async`](Self::search_async). The async path runs the partition loop
+//! in [`tokio::task::spawn_blocking`] so the runtime is not blocked by GPU work.
 
 use super::evaluator::ConfigEvaluator;
 use super::expander::{ExpanderDecomposer, ExpanderParams, ExpanderPartition};
@@ -119,6 +123,23 @@ impl SearchCoordinator {
         );
 
         Ok(result)
+    }
+
+    /// Run the same search on the tokio runtime without blocking it.
+    ///
+    /// The partition loop (and thus GPU evaluation) runs inside
+    /// `tokio::task::spawn_blocking`, so the async runtime remains responsive.
+    /// Use this from async code (e.g. `#[tokio::main]`) to allow cancellation
+    /// and composition with other async tasks.
+    pub async fn search_async(&self) -> Result<SearchResult> {
+        let config = self.config.clone();
+        let evaluator = Arc::clone(&self.evaluator);
+        tokio::task::spawn_blocking(move || {
+            let coordinator = SearchCoordinator { config, evaluator };
+            coordinator.search()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("search task join: {}", e))?
     }
 
     fn search_partition(

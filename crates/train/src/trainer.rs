@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::{loss, ops, AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 
-use ternary_common::{batch_to_tensors, OneBitLlmConfig, TextDataset};
+use ternary_common::{batch_to_tensors, BatchDataset, OneBitLlmConfig};
 use ternary_core::{compression_stats, OneBitLlm};
 
 use crate::scheduler::{AnnealSchedule, LrDecay, LrScheduler};
@@ -224,7 +224,7 @@ impl Trainer {
     }
 
     /// Evaluate validation perplexity.
-    pub fn evaluate(&self, val_ds: &TextDataset) -> anyhow::Result<(f64, f64)> {
+    pub fn evaluate(&self, val_ds: &impl BatchDataset) -> anyhow::Result<(f64, f64)> {
         let batch_size = self.config.batch_size;
         let seq_len = self.model_config.max_seq_len;
         let mut loss_sum = 0.0f64;
