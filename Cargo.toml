@@ -9,12 +9,12 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-authors = ["OneBit-LLM Contributors"]
+authors = ["Ternary-Core Contributors"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/onebit-llm/onebit-llm"
-description = "A comprehensive framework for training, searching, and deploying 1-bit & 1.58-bit LLMs in pure Rust"
+repository = "https://github.com/onebit-llm/ternary-core"
+description = "Ternary-Core: 1.58-bit LLM framework in Rust — mixed-precision (Sandwich Rule), training, search, inference"
 
 # ── Shared dependency versions ──────────────────────────────────────────────
 # Every crate in the workspace should reference these via:

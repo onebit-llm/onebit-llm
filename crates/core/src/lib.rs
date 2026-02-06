@@ -29,7 +29,7 @@ pub mod quantize;
 // ── Public re-exports ───────────────────────────────────────────────────────
 
 pub use attention::LayerKVCache;
-pub use linear::{BinaryLinear, BitLinearLayer, TernaryLinear};
+pub use linear::{BinaryLinear, BitLinearLayer, EightBitLinear, F16Linear, TernaryLinear};
 pub use model::{compression_stats, CompressionStats, OneBitLlm};
 pub use quantize::{
     current_anneal_frac, set_quant_anneal_frac, ste_sign_scaled, ste_tanh_scaled,

@@ -18,6 +18,9 @@ struct Args {
     max_size_mb: Option<f64>,
     #[arg(long)]
     min_accuracy: Option<f64>,
+    /// Reject configs with perplexity above this (min-perplexity constraint).
+    #[arg(long)]
+    min_perplexity_max: Option<f64>,
     #[arg(long, default_value_t = 1000)]
     max_evaluations: usize,
     #[arg(long, default_value_t = 100)]
@@ -50,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
         tokenizer: args.tokenizer,
         max_size_mb: args.max_size_mb,
         min_accuracy: args.min_accuracy,
+        min_perplexity_max: args.min_perplexity_max,
         max_evaluations: args.max_evaluations,
         partition_size: args.partition_size,
         overlap_ratio: args.overlap_ratio,

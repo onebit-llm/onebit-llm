@@ -176,12 +176,13 @@ impl Trainer {
         // Optimiser step
         self.optimizer.step(&grads)?;
 
-        // Latent weight clamping (uses config value, not hard-coded 1.2)
-        let clamp = self.model_config.latent_clamp_max;
+        // Latent weight clipping after every update (prevents gradient explosion).
+        // Uses latent_clip_max_training (default 1.2); only clamp F32 params (latent weights).
+        let clip = self.model_config.latent_clip_max_training;
         for var in &self.vars {
             let t = var.as_tensor();
             if t.dtype() == DType::F32 {
-                let clamped = t.clamp(-clamp as f32, clamp as f32)?;
+                let clamped = t.clamp(-clip as f32, clip as f32)?;
                 var.set(&clamped)?;
             }
         }

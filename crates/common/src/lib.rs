@@ -11,7 +11,7 @@
 pub mod config;
 pub mod data;
 
-pub use config::{FfnActivation, OneBitLlmConfig};
+pub use config::{FfnActivation, LayerBitMap, OneBitLlmConfig, QuantMode};
 pub use data::{
     batch_to_tensors, write_tokenized_file, AnyBatchDataset, BatchDataset, MmapDataset,
     StreamingBatchIter, TextDataset,

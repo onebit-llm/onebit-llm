@@ -1,6 +1,6 @@
 //! Config evaluation using Candle model.
 
-use super::types::{config_key, QuantConfig, QuantLevel};
+use super::types::{config_key, QuantConfig};
 use candle_core::{DType, Device, Result as CandleResult};
 use candle_nn::{VarBuilder, VarMap};
 use std::path::Path;
@@ -66,13 +66,8 @@ impl ConfigEvaluator {
 
     fn build_model_with_config(&self, config: &QuantConfig) -> anyhow::Result<OneBitLlm> {
         let mut model_config = self.base_model_config.clone();
-        let binary_count = (0..config.num_layers)
-            .filter(|&i| config.get_layer(i) == QuantLevel::Binary)
-            .count();
-        let ternary_count = (0..config.num_layers)
-            .filter(|&i| config.get_layer(i) == QuantLevel::Ternary)
-            .count();
-        model_config.use_ternary = ternary_count > binary_count;
+        // Sandwich Rule: use layer_bit_map with embedding/lm_head pinned F16.
+        model_config.layer_bit_map = Some(config.to_layer_bit_map());
 
         let mut varmap = VarMap::new();
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &self.device);

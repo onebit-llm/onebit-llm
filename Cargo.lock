@@ -1904,7 +1904,7 @@ dependencies = [
 
 [[package]]
 name = "ternary-common"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -1918,7 +1918,7 @@ dependencies = [
 
 [[package]]
 name = "ternary-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -1931,7 +1931,7 @@ dependencies = [
 
 [[package]]
 name = "ternary-infer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -1950,7 +1950,7 @@ dependencies = [
 
 [[package]]
 name = "ternary-search"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -1975,7 +1975,7 @@ dependencies = [
 
 [[package]]
 name = "ternary-train"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "candle-core",

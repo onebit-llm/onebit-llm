@@ -15,7 +15,7 @@
 use candle_core::{Result, Tensor};
 use candle_nn::VarBuilder;
 
-use ternary_common::{FfnActivation, OneBitLlmConfig};
+use ternary_common::{FfnActivation, OneBitLlmConfig, QuantMode};
 
 use crate::linear::BitLinearLayer;
 
@@ -62,28 +62,45 @@ pub enum FfnLayer {
 }
 
 impl FfnLayer {
-    /// Construct from config.
+    /// Construct from config (uses config.use_ternary for Binary vs Ternary).
+    pub fn new(config: &OneBitLlmConfig, vb: VarBuilder) -> Result<Self> {
+        let mode = if config.use_ternary {
+            QuantMode::Ternary
+        } else {
+            QuantMode::Binary
+        };
+        Self::new_with_mode(config, mode, vb)
+    }
+
+    /// Construct with explicit QuantMode (Sandwich Rule: per-layer bit-width).
     ///
     /// * Standard FFN: 2 projections (`c_fc`, `c_proj`).
     /// * SwiGLU FFN: 3 projections (`w_gate`, `w_up`, `w_down`).
-    pub fn new(config: &OneBitLlmConfig, vb: VarBuilder) -> Result<Self> {
+    pub fn new_with_mode(
+        config: &OneBitLlmConfig,
+        mode: QuantMode,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         match config.ffn_activation() {
             FfnActivation::SwiGLU => {
-                let w_gate = BitLinearLayer::new(
+                let w_gate = BitLinearLayer::new_with_mode(
                     config.hidden_size,
                     config.intermediate_size,
+                    mode,
                     config,
                     vb.pp("w_gate"),
                 )?;
-                let w_up = BitLinearLayer::new(
+                let w_up = BitLinearLayer::new_with_mode(
                     config.hidden_size,
                     config.intermediate_size,
+                    mode,
                     config,
                     vb.pp("w_up"),
                 )?;
-                let w_down = BitLinearLayer::new(
+                let w_down = BitLinearLayer::new_with_mode(
                     config.intermediate_size,
                     config.hidden_size,
+                    mode,
                     config,
                     vb.pp("w_down"),
                 )?;
@@ -94,16 +111,17 @@ impl FfnLayer {
                 }))
             }
             activation => {
-                // Standard 2-projection FFN (SiLU or ReLU²)
-                let w_up = BitLinearLayer::new(
+                let w_up = BitLinearLayer::new_with_mode(
                     config.hidden_size,
                     config.intermediate_size,
+                    mode,
                     config,
                     vb.pp("c_fc"),
                 )?;
-                let w_down = BitLinearLayer::new(
+                let w_down = BitLinearLayer::new_with_mode(
                     config.intermediate_size,
                     config.hidden_size,
+                    mode,
                     config,
                     vb.pp("c_proj"),
                 )?;

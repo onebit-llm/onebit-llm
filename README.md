@@ -1,10 +1,10 @@
 <p align="center">
-  <strong>OneBit-LLM</strong><br>
-  <em>A comprehensive Rust framework for training, optimising, and deploying 1-bit &amp; 1.58-bit Large Language Models.</em>
+  <strong>Ternary-Core: 1.58-bit LLM Framework in Rust</strong><br>
+  <em>Mixed-precision training, search, and inference for models small enough for embedded devices.</em>
 </p>
 
 <p align="center">
-  <a href="https://github.com/onebit-llm/onebit-llm/actions"><img src="https://img.shields.io/github/actions/workflow/status/onebit-llm/onebit-llm/ci.yml?label=build" alt="Build"></a>
+  <a href="https://github.com/onebit-llm/ternary-core/actions"><img src="https://img.shields.io/github/actions/workflow/status/onebit-llm/onebit-llm/ci.yml?label=build" alt="Build"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue" alt="License"></a>
   <a href="https://crates.io/crates/ternary-core"><img src="https://img.shields.io/crates/v/ternary-core?label=crates.io" alt="Crates.io"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-2021%20edition-orange" alt="Rust"></a>
@@ -13,47 +13,57 @@
 
 ---
 
-## Why OneBit?
+## Why Ternary-Core?
 
-Standard LLMs store every weight as a 16-bit or 32-bit floating-point number.
-**OneBit-LLM** compresses weights to just **1 bit** (Binary: +/-1) or **1.58 bits**
-(Ternary: {-1, 0, +1}) during training -- not as a post-hoc quantisation step,
-but as a *first-class training objective* via the Straight-Through Estimator.
+Standard LLMs use 16-bit or 32-bit weights. **Ternary-Core** uses **mixed-precision** (the **Sandwich Rule**): keep **embedding** and **LM head** in high precision (F16 / 8-bit) and compress **hidden layers** to **1.58-bit Ternary** (or 1-bit Binary). That gives **~20× compression vs FP16** while avoiding the **Information Collapse** that full quantization caused.
 
-### Memory comparison
+### How we achieve ~20× compression vs FP16
 
-```
-Model (45M params)       Memory (weights only)
----------------------    ---------------------
-FP32 (baseline)          ~180 MB
-FP16                      ~90 MB
-INT8                      ~45 MB
-Ternary (1.58-bit)       ~11 MB    <-- OneBit-LLM
-Binary  (1-bit)           ~5.6 MB
-```
+| Precision   | Bits/param | Relative size |
+|------------|------------|----------------|
+| FP32       | 32         | 1× (baseline)  |
+| FP16       | 16         | 0.5×           |
+| 8-bit      | 8          | 0.25×          |
+| **Ternary**| **~1.58**  | **~0.1×**      |
+| Binary     | 1          | ~0.06×         |
 
-> **Core principle:** *Compute is cheap, Memory is expensive.*
-> On edge devices, DRAM bandwidth is the bottleneck -- not FLOPs.
-> A 16x memory reduction means 16x more model fits in cache.
+By keeping only the middle layers in Ternary and the input/output in F16, we get a model that is **small enough for embedded devices (e.g. ESP32)** but **smart enough to generate coherent text**.
 
 ---
 
 ## Architecture
 
+### Sandwich quantization (mixed precision)
+
+```
+  [Embedding]          F16 / 8-bit   (high precision — avoid information collapse)
+       ↓
+  [Decoder Layer 0]     Ternary / Binary
+  [Decoder Layer 1]     Ternary / Binary
+  ...                   ...
+  [Decoder Layer N]     Ternary / Binary
+       ↓
+  [LM Head]             F16 / 8-bit   (high precision — coherent logits)
+```
+
+The **search** crate produces a **bit-map JSON** that pins embedding and LM head to high precision and assigns Ternary/Binary per decoder layer; **training** and **inference** consume this map.
+
+### Workspace layout
+
 ```
                             +------------------------------------------+
-                            |           onebit-llm workspace           |
+                            |           ternary-core workspace        |
                             +------------------------------------------+
                                               |
                 +-------------+---------------+---------------+-------------+
                 v             v               v               v             v
         +--------------+ +------------+ +--------------+ +----------+ +----------+
         | ternary-core | |  ternary-  | | ternary-     | | ternary- | | ternary- |
-        |              | |  common    | | train        | | search   | | infer    |
-        |  BitLinear   | |  Config    | |  AdamW +     | | Expander | | Sampler  |
-        |  RMSNorm     | |  Tokenizer | |  Clipping    | | Graph    | | Top-P    |
-        |  SwiGLU      | |  Data I/O  | |  Annealing   | | Coord.   | | .1bit    |
-        |  RoPE        | |  Safetens. | |  Scheduler   | | Eval.    | | Export   |
+        |              | |  common   | | train        | | search   | | infer    |
+        |  BitLinear   | |  Config   | |  AdamW +     | | Bit-map  | | KV-cache |
+        |  QuantMode   | |  LayerBit | |  Latent clip | | Min-ppl  | | Top-P    |
+        |  RMSNorm    | |  Tokenizer| |  Annealing   | | Pinned   | | Export   |
+        |  RoPE       | |  Mmap     | |  Scheduler   | | Eval.    | | .1bit    |
         +--------------+ +------------+ +--------------+ +----------+ +----------+
                |               |               |              |            |
                +---------------+---------------+--------------+------------+
@@ -65,11 +75,11 @@ Binary  (1-bit)           ~5.6 MB
 
 | Crate | Role | Binaries |
 |-------|------|----------|
-| **ternary-core** | Mathematical engine: `BitLinear`, `TernaryLinear`, RMSNorm, SwiGLU, RoPE, QK-Norm, STE, soft-to-hard annealing | -- |
-| **ternary-common** | Shared config, tokenizer wrapper, data pipeline (`TextDataset`, `StreamingBatchIter`) | -- |
-| **ternary-train** | Trainer with AdamW, latent weight clipping, gradient accumulation, cosine LR scheduler, annealing schedule | `onebit-train` |
-| **ternary-search** | Graph-based quantisation search: Expander decomposition, Dijkstra, cached evaluator | `onebit-search`, `onebit-eval-config` |
-| **ternary-infer** | Inference runtime, sampler (top-k/top-p/temperature/repetition penalty), `.1bit` binary export | `onebit-chat`, `onebit-export`, `onebit-test-generate` |
+| **ternary-core** | Math engine: `BitLinear` (F16/8bit/Ternary/Binary), RMSNorm, SwiGLU, RoPE, STE, annealing | -- |
+| **ternary-common** | Config, `QuantMode`, `LayerBitMap`, tokenizer, mmap datasets | -- |
+| **ternary-train** | AdamW, latent clipping (default 1.2), cosine LR, annealing | `onebit-train`, `onebit-tokenize` |
+| **ternary-search** | Bit-width search with **min-perplexity** constraint; output **bit-map JSON**; embedding/head **pinned** F16 | `onebit-search`, `onebit-eval-config` |
+| **ternary-infer** | KV-cache, repetition penalty, Top-P sampling, `.1bit` export | `onebit-chat`, `onebit-export`, `onebit-test-generate` |
 
 ### Training loop (Annealing -> Quantise -> Backprop)
 
@@ -122,35 +132,64 @@ onebit-llm/
 
 ## Quick Start
 
+### 1. Download data
+
+```bash
+python scripts/download_wikitext.py   # or wget WikiText-103 / OpenWebText
+```
+
+### 2. Tokenize (optional; for mmap or pre-tokenized)
+
+```bash
+cargo run -p ternary-train --bin onebit-tokenize -- \
+  --data-dir data/wikitext-103-raw --tokenizer tokenizer.json \
+  --out-dir data/tokenized
+```
+
+### 3. Train (mixed-precision: Sandwich Rule by default)
+
+```bash
+cargo run --release -p ternary-train --bin onebit-train --features cuda -- \
+  --config config.json \
+  --data-dir ./data/tokenized \
+  --tokenizer ./data/tokenizer.json \
+  --output-dir ./checkpoints \
+  --batch-size 4 --accumulation-steps 4 \
+  --lr 5e-3 --lr-decay cosine --lr-warmup-steps 200 \
+  --max-steps 10000 --save-every 1000 --log-every 100
+```
+
+### 4. Search (bit-map with min-perplexity; embedding/head pinned)
+
+```bash
+cargo run --release -p ternary-search --bin onebit-search --features cuda -- \
+  --model-config config.json --checkpoint checkpoints/model.safetensors \
+  --val-data data/val.txt --tokenizer data/tokenizer.json \
+  --min-perplexity-max 50 \
+  --output search_result.json
+```
+
+`search_result.json` contains `layer_bit_map` (embedding/lm_head F16, per-layer Ternary/Binary) for inference.
+
+### 5. Chat (inference)
+
+```bash
+cargo run --release -p ternary-infer --bin onebit-chat --features cuda -- \
+  --model-dir ./checkpoints \
+  --temperature 0.7 --top-p 0.9 --repetition-penalty 1.2
+```
+
 ### Build
 
 ```bash
-# CPU-only (default -- compiles everywhere including WASM)
+# CPU-only (default)
 cargo build --release
 
 # With CUDA acceleration
 cargo build --release --features cuda
 
-# With Metal acceleration (Apple Silicon)
+# With Metal (Apple Silicon)
 cargo build --release --features metal
-```
-
-### Train
-
-```bash
-cargo run --release -p ternary-train --bin onebit-train --features cuda -- \
-  --config config.json \
-  --data-dir ./data/wikitext-103-raw \
-  --tokenizer ./data/tokenizer.json \
-  --output-dir ./checkpoints \
-  --batch-size 4 \
-  --accumulation-steps 4 \
-  --lr 5e-3 \
-  --lr-decay cosine \
-  --lr-warmup-steps 200 \
-  --max-steps 10000 \
-  --save-every 1000 \
-  --log-every 100
 ```
 
 For large datasets that don't fit in RAM, add `--streaming`:
@@ -166,7 +205,7 @@ cargo run --release -p ternary-train --bin onebit-train --features cuda -- \
   --max-steps 100000
 ```
 
-### Search (optimal bit-width map)
+### Search (optimal bit-width map; min-perplexity constraint)
 
 ```bash
 cargo run --release -p ternary-search --bin onebit-search --features cuda -- \
@@ -174,9 +213,12 @@ cargo run --release -p ternary-search --bin onebit-search --features cuda -- \
   --checkpoint checkpoints/model.safetensors \
   --val-data data/val.txt \
   --tokenizer data/tokenizer.json \
+  --min-perplexity-max 50 \
   --max-size-mb 100 \
-  --output best_config.json
+  --output search_result.json
 ```
+
+The output JSON includes `layer_bit_map` (embedding/lm_head pinned F16).
 
 ### Chat (interactive inference)
 
@@ -202,7 +244,7 @@ cargo run --release -p ternary-infer --bin onebit-export -- \
 
 ## Configuration
 
-`config.json` controls every aspect of the model architecture:
+`config.json` controls the model. For **mixed precision**, use `layer_bit_map` (or leave unset for Sandwich default: embedding/lm_head F16, layers Ternary).
 
 | Field | Default | Description |
 |-------|---------|-------------|
@@ -212,19 +254,19 @@ cargo run --release -p ternary-infer --bin onebit-export -- \
 | `num_layers` | 6 | Decoder layers |
 | `intermediate_size` | 2048 | FFN intermediate dim |
 | `max_seq_len` | 512 | Maximum sequence length |
-| `use_ternary` | false | Ternary {-1,0,+1} vs Binary +/-1 |
-| `use_relu2` | false | ReLU squared activation (BitNet-style) |
-| `use_swiglu` | false | SwiGLU activation (LLaMA/Mistral-style, 3 projections) |
-| `use_subln` | false | RMSNorm instead of LayerNorm |
+| `use_ternary` | false | Global: Ternary vs Binary (ignored if `layer_bit_map` set) |
+| `layer_bit_map` | null | Per-layer `QuantMode` (embedding, layer_modes, lm_head); Sandwich default when null |
+| `use_swiglu` | false | SwiGLU (3 projections) |
 | `use_rope` | false | Rotary position embeddings |
-| `use_qk_norm` | true | RMSNorm on Q/K (stabilises attention) |
-| `use_residual_scaling` | true | Scale sub-layer by 1/sqrt(2) |
-| `use_dynamic_threshold` | true | delta = 0.7 x mean(\|W\|) for ternary |
+| `use_qk_norm` | true | RMSNorm on Q/K |
+| `use_residual_scaling` | true | Scale sub-layer by 1/√2 |
+| `use_dynamic_threshold` | true | δ = 0.7×mean(\|W\|) for ternary |
 | `ste_scale_factor` | 2.0 | STE gradient multiplier |
-| `latent_clamp_max` | 1.5 | Latent weight clamp bound |
-| `anneal_fraction` | 0.3 | Fraction of training in soft annealing regime |
-| `arenas_initial` | null | Arenas FP residual coefficient (null = disabled) |
-| `arenas_anneal_steps` | 10000 | Steps to anneal Arenas -> 0 |
+| `latent_clamp_max` | 1.5 | Forward clamp for latent weights |
+| `latent_clip_max_training` | 1.2 | Clamp after each optimizer step |
+| `anneal_fraction` | 0.3 | Fraction of training in soft annealing |
+| `arenas_initial` | null | Arenas FP residual (null = disabled) |
+| `arenas_anneal_steps` | 10000 | Steps to anneal Arenas → 0 |
 
 ---
 
@@ -249,9 +291,8 @@ weights are near zero.
 
 ### Latent Weight Clipping
 
-After every optimiser step, latent weights are clamped to `[-latent_clamp_max, +latent_clamp_max]`
-(default 1.5). This keeps them within reach of the quantisation thresholds so
-they can still flip between {-1, 0, +1} as the model learns.
+After every optimiser step, latent weights are clamped to `[-latent_clip_max_training, +latent_clip_max_training]`
+(default **1.2**) to prevent gradient explosion. Forward pass uses `latent_clamp_max` (default 1.5).
 
 ### KV-Cache (O(1) per-token decoding)
 
@@ -338,40 +379,41 @@ Generation was tested with `onebit-test-generate` (temperature 0.7, top-k 40, to
 
 ---
 
+## Benchmarks (Size vs Perplexity)
+
+| Config | Size (approx) | Perplexity (target) | Notes |
+|--------|----------------|---------------------|-------|
+| Pure Ternary (all layers) | Smallest | High (collapse risk) | Not recommended |
+| **Sandwich (F16 embed/head + Ternary body)** | **~20× vs FP16** | **Controlled** | **Default; use min-perplexity in search** |
+| Mixed (search with min-perplexity-max) | Variable | ≤ threshold | Search output bit-map |
+
+Use `--min-perplexity-max` in search to enforce a perplexity ceiling; the search outputs a bit-map JSON that meets the constraint while minimizing size.
+
 ## Documentation
 
 | Document | Description |
 |----------|-------------|
-| [docs/MASTER_PLAN.md](docs/MASTER_PLAN.md) | Detailed architectural blueprint with Rust code specifications |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute (fork, PR, join the org) |
+| [docs/SANDWICH_RULE.md](docs/SANDWICH_RULE.md) | Mixed-precision and why embedding/head stay high precision |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Workspace layout and crate roles |
+| [docs/MASTER_PLAN.md](docs/MASTER_PLAN.md) | Detailed architectural blueprint |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute |
 | [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | Community standards |
 
 ---
 
 ## Roadmap
 
-- [x] Cargo Workspace with 5 focused crates
-- [x] Binary & Ternary linear layers with STE
-- [x] Soft -> Hard annealing schedule (global atomic)
-- [x] RMSNorm, RoPE, QK-Norm, residual scaling
-- [x] SwiGLU activation (3-projection FFN)
-- [x] Arenas residual annealing
-- [x] `Trainer` struct with AdamW, latent clipping, gradient accumulation
-- [x] Cosine / linear / constant LR scheduler with warmup
-- [x] Cross-entropy with label smoothing
-- [x] Streaming data pipeline (`TextDataset` + `StreamingBatchIter`)
-- [x] Expander-based quantisation search (graph + Dijkstra)
-- [x] Cached config evaluator with LRU
-- [x] Inference sampler: top-k, top-p, temperature, repetition penalty
-- [x] `.1bit` binary export format with C-compatible header
-- [x] End-to-end train -> checkpoint -> inference pipeline verified on GPU
-- [x] KV-Cache for O(1) per-token decoding
-- [x] `memmap2` zero-copy dataset loading (`MmapDataset`)
-- [x] `tokio`-based async search coordinator
-- [ ] WASM compilation target
-- [ ] `no_std` core support for embedded
-- [ ] Hugging Face model hub integration
-- [ ] Speculative decoding with tiny draft model
+- [x] Cargo Workspace with 5 crates (core, common, train, search, infer)
+- [x] **Mixed-precision BitLinear** (QuantMode: F16, EightBit, Ternary, Binary)
+- [x] **Sandwich Rule** (embedding/lm_head high precision; LayerBitMap)
+- [x] Soft → hard annealing, STE, latent clipping (default 1.2)
+- [x] RMSNorm, RoPE, QK-Norm, SwiGLU, Arenas
+- [x] Trainer: AdamW, gradient accumulation, cosine LR
+- [x] **Search: min-perplexity constraint, bit-map JSON output, pin embed/head**
+- [x] Inference: KV-cache, Top-P, repetition penalty, `.1bit` export
+- [x] `memmap2` zero-copy datasets; `tokio` async search
+- [ ] WASM target; `no_std` core for embedded (e.g. ESP32)
+- [ ] Hugging Face integration; speculative decoding
 
 ---
 

@@ -1,22 +1,20 @@
-//! Binary and ternary linear layers with Straight-Through Estimator (STE).
+//! Mixed-precision linear layers: F16, EightBit, Ternary, Binary (BitLinear).
 //!
-//! These are the fundamental building blocks of a 1-bit transformer.
-//! Each layer stores full-precision (f32) "latent" weights. During the forward
-//! pass the weights are quantised to {±1} or {-1, 0, +1}; during the backward
-//! pass gradients flow to the latent weights via the STE.
+//! **Sandwich Rule:** Use [`QuantMode`] to keep embedding and LM head in F16/EightBit,
+//! and hidden layers in Ternary or Binary. Each quantized layer stores full-precision
+//! (f32) "latent" weights; forward uses quantized values; backward uses STE.
 //!
 //! # Thread safety
 //!
 //! The inference cache uses [`parking_lot::Mutex`] instead of `RefCell`,
-//! making these layers `Send + Sync`. This is required for the async search
-//! coordinator and future multi-threaded inference.
+//! making these layers `Send + Sync`.
 
 use parking_lot::Mutex;
 
 use candle_core::{Result, Tensor};
 use candle_nn::{Init, Linear, Module, VarBuilder};
 
-use ternary_common::OneBitLlmConfig;
+use ternary_common::{OneBitLlmConfig, QuantMode};
 
 use crate::quantize::{
     current_anneal_frac, debug_binary_distribution, debug_ternary_distribution, matmul_reshape,
@@ -232,20 +230,72 @@ impl Module for TernaryLinear {
     }
 }
 
-// ── BitLinearLayer ──────────────────────────────────────────────────────────
+// ── F16Linear (Full precision) ───────────────────────────────────────────────
 
-/// Dispatch enum: selects Binary or Ternary based on config at construction.
+/// Full-precision linear layer (F16/f32). Used for embedding and LM head in the Sandwich Rule.
+pub struct F16Linear {
+    inner: Linear,
+}
+
+impl F16Linear {
+    pub fn new(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
+        let inner = candle_nn::linear(in_dim, out_dim, vb)?;
+        Ok(Self { inner })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.inner.forward(x)
+    }
+}
+
+impl Module for F16Linear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward(x)
+    }
+}
+
+// ── EightBitLinear (Stub: full precision for now) ───────────────────────────
+
+/// 8-bit quantized linear layer. Currently implemented as full precision;
+/// export/inference can apply 8-bit quantization. Used in Sandwich Rule for
+/// optional embedding/lm_head middle ground.
+pub struct EightBitLinear {
+    inner: Linear,
+}
+
+impl EightBitLinear {
+    pub fn new(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
+        let inner = candle_nn::linear(in_dim, out_dim, vb)?;
+        Ok(Self { inner })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.inner.forward(x)
+    }
+}
+
+impl Module for EightBitLinear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward(x)
+    }
+}
+
+// ── BitLinearLayer (Mixed precision dispatch) ────────────────────────────────
+
+/// Dispatch enum: F16, EightBit, Ternary, or Binary per layer (Sandwich Rule).
 ///
-/// This is the type used by attention and FFN blocks. Code that doesn't care
-/// about the specific variant calls methods on this enum.
+/// This is the type used by attention and FFN blocks. Construct with
+/// [`BitLinearLayer::new_with_mode`] when using a layer bit-map.
 pub enum BitLinearLayer {
+    F16(F16Linear),
+    EightBit(EightBitLinear),
     Binary(BinaryLinear),
     Ternary(TernaryLinear),
 }
 
 impl BitLinearLayer {
-    /// Construct a new bit-linear layer from config. Uses `config.use_ternary`
-    /// to decide the variant.
+    /// Construct from config: uses `config.use_ternary` for Binary vs Ternary only.
+    /// For Sandwich Rule use [`BitLinearLayer::new_with_mode`].
     pub fn new(
         in_dim: usize,
         out_dim: usize,
@@ -272,8 +322,43 @@ impl BitLinearLayer {
         }
     }
 
+    /// Construct with explicit [`QuantMode`] for mixed-precision (Sandwich Rule).
+    ///
+    /// * F16 / EightBit: no STE, no annealing; standard forward.
+    /// * Ternary / Binary: latent weights, STE, annealing; `config` supplies
+    ///   ste_scale_factor, latent_clamp_max, use_dynamic_threshold.
+    pub fn new_with_mode(
+        in_dim: usize,
+        out_dim: usize,
+        mode: QuantMode,
+        config: &OneBitLlmConfig,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        match mode {
+            QuantMode::F16 => Ok(Self::F16(F16Linear::new(in_dim, out_dim, vb)?)),
+            QuantMode::EightBit => Ok(Self::EightBit(EightBitLinear::new(in_dim, out_dim, vb)?)),
+            QuantMode::Ternary => Ok(Self::Ternary(TernaryLinear::new(
+                in_dim,
+                out_dim,
+                vb,
+                config.use_dynamic_threshold,
+                config.ste_scale_factor,
+                config.latent_clamp_max,
+            )?)),
+            QuantMode::Binary => Ok(Self::Binary(BinaryLinear::new(
+                in_dim,
+                out_dim,
+                vb,
+                config.ste_scale_factor,
+                config.latent_clamp_max,
+            )?)),
+        }
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
+            Self::F16(l) => l.forward(x),
+            Self::EightBit(l) => l.forward(x),
             Self::Binary(l) => l.forward(x),
             Self::Ternary(l) => l.forward(x),
         }
@@ -282,6 +367,8 @@ impl BitLinearLayer {
     /// Human-readable weight distribution string.
     pub fn debug_weight_distribution(&self) -> Result<String> {
         match self {
+            Self::F16(_) => Ok("f16 (full precision)".to_string()),
+            Self::EightBit(_) => Ok("8bit (stub)".to_string()),
             Self::Binary(l) => {
                 let (neg, pos) = l.debug_weight_distribution()?;
                 Ok(format!("binary -1:{neg} +1:{pos}"))
@@ -295,6 +382,7 @@ impl BitLinearLayer {
 
     pub fn cache_quantized(&self) -> Result<()> {
         match self {
+            Self::F16(_) | Self::EightBit(_) => Ok(()),
             Self::Binary(l) => l.cache_quantized(),
             Self::Ternary(l) => l.cache_quantized(),
         }
@@ -302,6 +390,7 @@ impl BitLinearLayer {
 
     pub fn clear_cache(&self) {
         match self {
+            Self::F16(_) | Self::EightBit(_) => {}
             Self::Binary(l) => l.clear_cache(),
             Self::Ternary(l) => l.clear_cache(),
         }

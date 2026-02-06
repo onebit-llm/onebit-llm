@@ -73,10 +73,16 @@ impl SearchCoordinator {
                 .progress_chars("=>-"),
         );
 
+        let min_perplexity_max = self.config.min_perplexity_max;
         let mut partition_results = Vec::new();
         for partition in &partitions {
-            let result =
-                Self::search_partition(self.evaluator.as_ref(), &graph, partition, start_node);
+            let result = Self::search_partition(
+                self.evaluator.as_ref(),
+                &graph,
+                partition,
+                start_node,
+                min_perplexity_max,
+            );
             partition_results.push(result);
             pb.inc(1);
         }
@@ -104,7 +110,8 @@ impl SearchCoordinator {
         let compression_ratio = best_config.compression_ratio(&params_per_layer);
 
         let result = SearchResult {
-            config: best_config,
+            config: best_config.clone(),
+            layer_bit_map: best_config.to_layer_bit_map(),
             accuracy: -loss,
             perplexity,
             size_mb,
@@ -147,6 +154,7 @@ impl SearchCoordinator {
         graph: &super::graph::QuantGraph,
         partition: &ExpanderPartition,
         start_node: NodeIndex,
+        min_perplexity_max: Option<f64>,
     ) -> Option<(QuantConfig, f64)> {
         let partition_set: HashSet<NodeIndex> = partition.nodes.iter().copied().collect();
         let paths = dijkstra(graph, start_node, None, |e| {
@@ -166,8 +174,14 @@ impl SearchCoordinator {
             }
             if let Some(&path_cost) = paths.get(&node) {
                 let config = &graph[node];
-                if let Ok((loss, _ppl)) = evaluator.evaluate(config) {
+                if let Ok((loss, ppl)) = evaluator.evaluate(config) {
                     eval_count += 1;
+                    // Min-perplexity constraint: reject if above threshold.
+                    if let Some(max_ppl) = min_perplexity_max {
+                        if ppl > max_ppl {
+                            continue;
+                        }
+                    }
                     let score = -loss - 0.1 * path_cost;
                     if score.is_finite() {
                         if best.as_ref().map_or(true, |(_, s)| score > *s) {

@@ -1,9 +1,86 @@
-//! Model configuration for OneBit-LLM.
+//! Model configuration for Ternary-Core.
 //!
 //! Serialised as JSON for export/import. Every field has a sensible default so
 //! a minimal `{}` JSON will produce a working (if small) model.
+//!
+//! **Sandwich Rule:** Use [`QuantMode`] and [`LayerBitMap`] to keep embedding
+//! and LM head in high precision (F16 / EightBit) while middle layers use
+//! Ternary or Binary.
 
 use serde::{Deserialize, Serialize};
+
+// ── QuantMode (Mixed Precision) ─────────────────────────────────────────────
+
+/// Per-layer quantization mode for the "Sandwich Rule".
+///
+/// * **F16** — Full float16 (or f32 in candle); use for embedding and LM head.
+/// * **EightBit** — 8-bit quantization; optional middle ground.
+/// * **Ternary** — 1.58-bit {-1, 0, +1}; default for hidden layers.
+/// * **Binary** — 1-bit ±1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QuantMode {
+    F16,
+    EightBit,
+    Ternary,
+    Binary,
+}
+
+impl Default for QuantMode {
+    fn default() -> Self {
+        QuantMode::Ternary
+    }
+}
+
+impl std::fmt::Display for QuantMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuantMode::F16 => write!(f, "f16"),
+            QuantMode::EightBit => write!(f, "8bit"),
+            QuantMode::Ternary => write!(f, "ternary"),
+            QuantMode::Binary => write!(f, "binary"),
+        }
+    }
+}
+
+/// Bit-map: which bit-width to use for embedding, each decoder layer, and lm_head.
+///
+/// Produced by the search crate (min-perplexity constraint) and consumed by
+/// training and inference. **Pinned:** embedding and lm_head are typically
+/// F16 or EightBit to avoid information collapse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerBitMap {
+    /// Quantization mode for the token embedding (and tied lm_head).
+    #[serde(default)]
+    pub embedding: QuantMode,
+    /// Per-decoder-layer mode (length = num_layers). Applies to both attn and FFN in that block.
+    #[serde(default)]
+    pub layer_modes: Vec<QuantMode>,
+    /// Explicit lm_head mode; if None, uses same as embedding (weight-tied).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lm_head: Option<QuantMode>,
+}
+
+impl LayerBitMap {
+    /// Sandwich default: embedding and lm_head F16, all hidden layers Ternary.
+    pub fn sandwich_default(num_layers: usize) -> Self {
+        Self {
+            embedding: QuantMode::F16,
+            lm_head: None,
+            layer_modes: std::iter::repeat(QuantMode::Ternary).take(num_layers).collect(),
+        }
+    }
+
+    /// Mode for the LM head (tied to embedding if None).
+    pub fn lm_head_mode(&self) -> QuantMode {
+        self.lm_head.unwrap_or(self.embedding)
+    }
+
+    /// Mode for decoder layer `i` (0..num_layers).
+    pub fn layer_mode(&self, i: usize) -> QuantMode {
+        self.layer_modes.get(i).copied().unwrap_or(QuantMode::Ternary)
+    }
+}
 
 /// Configuration for the 1-bit decoder-only transformer.
 ///
@@ -68,6 +145,9 @@ pub struct OneBitLlmConfig {
     /// Latent weight clamp bound (forward clamps to [-C, +C]).
     #[serde(default = "default_latent_clamp_max")]
     pub latent_clamp_max: f64,
+    /// Latent weight clamp after each optimizer step (training only). Default 1.2.
+    #[serde(default = "default_latent_clip_training")]
+    pub latent_clip_max_training: f64,
 
     // ── Annealing ───────────────────────────────────────────────────────────
     /// **NEW (v0.2):** Fraction of total training steps spent in the soft
@@ -82,6 +162,12 @@ pub struct OneBitLlmConfig {
     /// Steps over which Arenas coefficient anneals to 0.
     #[serde(default = "default_arenas_anneal_steps")]
     pub arenas_anneal_steps: usize,
+
+    // ── Mixed precision (Sandwich Rule) ────────────────────────────────────
+    /// Optional per-layer bit map. If None, uses global `use_ternary` and
+    /// embedding/lm_head are treated as F16 when sandwich rule is desired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer_bit_map: Option<LayerBitMap>,
 }
 
 // ── Default value functions ─────────────────────────────────────────────────
@@ -97,6 +183,9 @@ fn default_ste_scale() -> f64 {
 }
 fn default_latent_clamp_max() -> f64 {
     1.5
+}
+fn default_latent_clip_training() -> f64 {
+    1.2
 }
 fn default_anneal_fraction() -> f32 {
     0.3
@@ -127,14 +216,36 @@ impl Default for OneBitLlmConfig {
             use_dynamic_threshold: true,
             ste_scale_factor: 2.0,
             latent_clamp_max: 1.5,
+            latent_clip_max_training: 1.2,
             anneal_fraction: 0.3,
             arenas_initial: None,
             arenas_anneal_steps: 10_000,
+            layer_bit_map: None,
         }
     }
 }
 
 impl OneBitLlmConfig {
+    /// Resolve embedding/lm_head QuantMode (Sandwich: F16 when using layer_bit_map).
+    pub fn embedding_quant_mode(&self) -> QuantMode {
+        self.layer_bit_map
+            .as_ref()
+            .map(|m| m.embedding)
+            .unwrap_or(QuantMode::F16)
+    }
+
+    /// Resolve QuantMode for decoder layer `i` (0..num_layers).
+    pub fn decoder_layer_quant_mode(&self, i: usize) -> QuantMode {
+        self.layer_bit_map
+            .as_ref()
+            .map(|m| m.layer_mode(i))
+            .unwrap_or(if self.use_ternary {
+                QuantMode::Ternary
+            } else {
+                QuantMode::Binary
+            })
+    }
+
     /// Head dimension (`hidden_size / num_heads`). Panics if not divisible.
     pub fn head_dim(&self) -> usize {
         assert!(

@@ -1,9 +1,15 @@
 //! Core types for quantisation search.
+//!
+//! **Pinned layers:** Embedding and LM head are always kept high-precision (F16)
+//! in the output bit-map to avoid information collapse (Sandwich Rule).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use ternary_common::{LayerBitMap, QuantMode};
+
 /// Per-layer quantisation level. Search space: Binary or Ternary only.
+/// (Embedding and lm_head are pinned to F16 and not searched.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum QuantLevel {
     Binary,  // 1-bit
@@ -45,6 +51,22 @@ impl QuantConfig {
             .copied()
             .unwrap_or(QuantLevel::Ternary)
     }
+
+    /// Convert to LayerBitMap for inference/training. Embedding and lm_head are
+    /// **pinned to F16** (Sandwich Rule); only decoder layers vary.
+    pub fn to_layer_bit_map(&self) -> LayerBitMap {
+        let layer_modes: Vec<QuantMode> = (0..self.num_layers)
+            .map(|i| match self.get_layer(i) {
+                QuantLevel::Binary => QuantMode::Binary,
+                QuantLevel::Ternary => QuantMode::Ternary,
+            })
+            .collect();
+        LayerBitMap {
+            embedding: QuantMode::F16,
+            lm_head: None,
+            layer_modes,
+        }
+    }
     pub fn total_size_mb(&self, params_per_layer: &[usize]) -> f64 {
         let mut total_bits = 0.0;
         for (layer, &params) in params_per_layer.iter().enumerate().take(self.num_layers) {
@@ -61,10 +83,12 @@ impl QuantConfig {
     }
 }
 
-/// Search result with all metrics.
+/// Search result with all metrics and the bit-map for inference/training.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub config: QuantConfig,
+    /// Bit-map JSON: embedding/lm_head pinned F16, layer_modes from search.
+    pub layer_bit_map: LayerBitMap,
     pub accuracy: f64,
     pub perplexity: f64,
     pub size_mb: f64,
@@ -84,6 +108,8 @@ pub struct SearchConfig {
     pub tokenizer: String,
     pub max_size_mb: Option<f64>,
     pub min_accuracy: Option<f64>,
+    /// Min-perplexity constraint: reject configs with perplexity above this.
+    pub min_perplexity_max: Option<f64>,
     pub max_evaluations: usize,
     pub partition_size: usize,
     pub overlap_ratio: f64,

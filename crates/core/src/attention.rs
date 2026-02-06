@@ -10,7 +10,7 @@ use candle_core::{DType, IndexOp, Result, Tensor, D};
 use candle_core::Error;
 use candle_nn::{rms_norm, Module, RmsNorm, VarBuilder};
 
-use ternary_common::OneBitLlmConfig;
+use ternary_common::{OneBitLlmConfig, QuantMode};
 
 use crate::linear::BitLinearLayer;
 
@@ -119,12 +119,28 @@ pub struct CausalSelfAttention {
 
 impl CausalSelfAttention {
     pub fn new(config: &OneBitLlmConfig, vb: VarBuilder) -> Result<Self> {
+        let mode = if config.use_ternary {
+            QuantMode::Ternary
+        } else {
+            QuantMode::Binary
+        };
+        Self::new_with_mode(config, mode, vb)
+    }
+
+    /// Construct with explicit QuantMode (Sandwich Rule: per-layer bit-width).
+    pub fn new_with_mode(
+        config: &OneBitLlmConfig,
+        mode: QuantMode,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let hidden = config.hidden_size;
         let num_heads = config.num_heads;
         let head_dim = config.head_dim();
 
-        let c_attn = BitLinearLayer::new(hidden, 3 * hidden, config, vb.pp("c_attn"))?;
-        let c_proj = BitLinearLayer::new(hidden, hidden, config, vb.pp("c_proj"))?;
+        let c_attn =
+            BitLinearLayer::new_with_mode(hidden, 3 * hidden, mode, config, vb.pp("c_attn"))?;
+        let c_proj =
+            BitLinearLayer::new_with_mode(hidden, hidden, mode, config, vb.pp("c_proj"))?;
 
         let (q_norm, k_norm) = if config.use_qk_norm {
             let q = rms_norm(head_dim, config.layer_norm_eps, vb.pp("q_norm"))?;

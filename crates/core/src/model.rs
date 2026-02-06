@@ -28,10 +28,12 @@ struct DecoderBlock {
 }
 
 impl DecoderBlock {
-    fn new(config: &OneBitLlmConfig, vb: VarBuilder) -> Result<Self> {
-        let attn = CausalSelfAttention::new(config, vb.pp("attn"))?;
+    /// `layer_idx`: 0..num_layers, used to resolve QuantMode from config.layer_bit_map.
+    fn new(config: &OneBitLlmConfig, layer_idx: usize, vb: VarBuilder) -> Result<Self> {
+        let quant_mode = config.decoder_layer_quant_mode(layer_idx);
+        let attn = CausalSelfAttention::new_with_mode(config, quant_mode, vb.pp("attn"))?;
         let ln1 = NormLayer::new(config, vb.pp("ln1"))?;
-        let ffn = FfnLayer::new(config, vb.pp("mlp"))?;
+        let ffn = FfnLayer::new_with_mode(config, quant_mode, vb.pp("mlp"))?;
         let ln2 = NormLayer::new(config, vb.pp("ln2"))?;
 
         let residual_scale = if config.use_residual_scaling {
@@ -128,7 +130,7 @@ impl OneBitLlm {
 
         let mut blocks = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
-            let block = DecoderBlock::new(config, vb.pp(format!("h.{i}")))?;
+            let block = DecoderBlock::new(config, i, vb.pp(format!("h.{i}")))?;
             blocks.push(block);
         }
 
