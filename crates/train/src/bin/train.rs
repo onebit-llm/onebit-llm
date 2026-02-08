@@ -151,6 +151,7 @@ fn main() -> anyhow::Result<()> {
             args.batch_size,
         )?;
 
+        let mut last_loss: Option<f32> = None;
         loop {
             if args.max_steps > 0 && trainer.global_step >= args.max_steps {
                 break;
@@ -167,15 +168,28 @@ fn main() -> anyhow::Result<()> {
             }
 
             let m = trainer.step(&batches)?;
+            last_loss = Some(m.loss);
 
             if args.log_every > 0 && m.step % args.log_every == 0 {
                 eprintln!("step {} loss {:.4} lr {:.2e}", m.step, m.loss, m.lr);
             }
-            if let Some(gn) = m.grad_norm {
-                eprintln!("  [debug] grad_norm {gn:.4}");
+            if m.grad_norm.is_some() || m.weight_mean_0.is_some() || m.weight_mean_1.is_some() {
+                let gn = m.grad_norm.map(|g| format!("{g:.6}")).unwrap_or_else(|| "n/a".to_string());
+                let w0 = match (m.weight_mean_0, m.weight_std_0) {
+                    (Some(mu), Some(s)) => format!("w0 mean={mu:.6} std={s:.6}"),
+                    _ => String::new(),
+                };
+                let w1 = match (m.weight_mean_1, m.weight_std_1) {
+                    (Some(mu), Some(s)) => format!("w1 mean={mu:.6} std={s:.6}"),
+                    _ => String::new(),
+                };
+                eprintln!("  [debug] grad_norm={gn}  {w0}  {w1}");
             }
 
             run_eval_and_checkpoint(&trainer, &val_dataset, &mut metrics_file, &args)?;
+        }
+        if let Some(loss) = last_loss {
+            eprintln!("step {} epoch 0 loss {:.4} (final)", trainer.global_step, loss);
         }
     } else {
         let seq_len = model_config.max_seq_len;
@@ -238,6 +252,7 @@ fn main() -> anyhow::Result<()> {
 
         let mut epoch = 0u32;
         let mut acc = Vec::with_capacity(args.accumulation_steps);
+        let mut last_loss: Option<f32> = None;
         while let Ok(msg) = rx.recv() {
             if args.max_steps > 0 && trainer.global_step >= args.max_steps {
                 break;
@@ -250,6 +265,7 @@ fn main() -> anyhow::Result<()> {
                     acc.push(batch);
                     if acc.len() >= args.accumulation_steps {
                         let m = trainer.step(&acc)?;
+                        last_loss = Some(m.loss);
                         acc.clear();
                         if args.log_every > 0 && m.step % args.log_every == 0 {
                             eprintln!(
@@ -257,8 +273,23 @@ fn main() -> anyhow::Result<()> {
                                 m.step, m.loss, m.lr
                             );
                         }
-                        if let Some(gn) = m.grad_norm {
-                            eprintln!("  [debug] grad_norm {gn:.4}");
+                        if m.grad_norm.is_some()
+                            || m.weight_mean_0.is_some()
+                            || m.weight_mean_1.is_some()
+                        {
+                            let gn = m
+                                .grad_norm
+                                .map(|g| format!("{g:.6}"))
+                                .unwrap_or_else(|| "n/a".to_string());
+                            let w0 = match (m.weight_mean_0, m.weight_std_0) {
+                                (Some(mu), Some(s)) => format!("w0 mean={mu:.6} std={s:.6}"),
+                                _ => String::new(),
+                            };
+                            let w1 = match (m.weight_mean_1, m.weight_std_1) {
+                                (Some(mu), Some(s)) => format!("w1 mean={mu:.6} std={s:.6}"),
+                                _ => String::new(),
+                            };
+                            eprintln!("  [debug] grad_norm={gn}  {w0}  {w1}");
                         }
                         run_eval_and_checkpoint(
                             &trainer,
@@ -277,12 +308,17 @@ fn main() -> anyhow::Result<()> {
         }
         if !acc.is_empty() {
             let m = trainer.step(&acc)?;
+            last_loss = Some(m.loss);
             if args.log_every > 0 {
                 eprintln!("step {} epoch {epoch} loss {:.4} lr {:.2e}", m.step, m.loss, m.lr);
             }
             run_eval_and_checkpoint(&trainer, &val_dataset, &mut metrics_file, &args)?;
         }
+        drop(rx);
         let _ = producer.join();
+        if let Some(loss) = last_loss {
+            eprintln!("step {} epoch {epoch} loss {:.4} (final)", trainer.global_step, loss);
+        }
     }
 
     let path = trainer.save_final()?;

@@ -44,6 +44,12 @@ pub struct StepMetrics {
     pub loss: f32,
     pub lr: f64,
     pub grad_norm: Option<f64>,
+    /// When debug_every triggers: (mean, std) of first param (e.g. embedding boundary).
+    pub weight_mean_0: Option<f64>,
+    pub weight_std_0: Option<f64>,
+    /// When debug_every triggers: (mean, std) of second param (first hidden layer).
+    pub weight_mean_1: Option<f64>,
+    pub weight_std_1: Option<f64>,
 }
 
 // ── Trainer ─────────────────────────────────────────────────────────────────
@@ -160,13 +166,19 @@ impl Trainer {
             .set_learning_rate(self.lr_scheduler.current_lr());
         let mut grads = total_loss.backward()?;
 
-        // Debug gradient norm
-        let debug_grad_norm =
-            if self.config.debug_every > 0 && self.global_step % self.config.debug_every == 0 {
-                Some(grad_norm(&grads, &self.vars)?)
-            } else {
-                None
-            };
+        // Debug: gradient norm and weight stats (for overfit sanity / Sandwich boundary check)
+        let debug = self.config.debug_every > 0
+            && self.global_step % self.config.debug_every == 0;
+        let debug_grad_norm = if debug {
+            Some(grad_norm(&grads, &self.vars)?)
+        } else {
+            None
+        };
+        let (w0_mean, w0_std, w1_mean, w1_std) = if debug {
+            weight_mean_std_first_two(&self.vars)?
+        } else {
+            (None, None, None, None)
+        };
 
         // Gradient clipping
         if self.config.grad_clip_max_norm > 0.0 {
@@ -198,6 +210,10 @@ impl Trainer {
             loss: loss_val,
             lr,
             grad_norm: debug_grad_norm,
+            weight_mean_0: w0_mean,
+            weight_std_0: w0_std,
+            weight_mean_1: w1_mean,
+            weight_std_1: w1_std,
         })
     }
 
@@ -276,13 +292,48 @@ fn cross_entropy_with_label_smoothing(
     let log_probs = ops::log_softmax(logits, 1)?;
     let nll = loss::nll(&log_probs, labels)?;
     let sum_log = log_probs.sum(1)?;
-    let neg_sum_mean = (sum_log.neg()?.mean_all()?.to_scalar::<f32>()?) as f64;
+    let neg_sum_mean = sum_log.neg()?.mean_all()?;
     let s = smoothing;
     let v = vocab_size as f64;
-    nll.affine(1.0 - s, s / v * neg_sum_mean)
+    
+    // (1.0 - s) * nll + (s / v) * neg_sum_mean
+    let l1 = nll.affine(1.0 - s, 0.0)?;
+    let l2 = neg_sum_mean.affine(s / v, 0.0)?;
+    (l1 + l2)
 }
 
-// ── Gradient utilities ──────────────────────────────────────────────────────
+// ── Gradient and weight diagnostics ────────────────────────────────────────
+
+/// Mean and std of first two variables (for Sandwich boundary: embedding vs first hidden).
+fn weight_mean_std_first_two(
+    vars: &[Var],
+) -> anyhow::Result<(
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+)> {
+    let mut out = (None, None, None, None);
+    for (i, var) in vars.iter().take(2).enumerate() {
+        let t = var.as_tensor();
+        if t.dtype() != DType::F32 {
+            continue;
+        }
+        let mean = t.mean_all()?.to_scalar::<f32>()? as f64;
+        let mean_sq = mean * mean;
+        let sq_mean = t.sqr()?.mean_all()?.to_scalar::<f32>()? as f64;
+        let var = (sq_mean - mean_sq).max(0.0);
+        let std = var.sqrt();
+        if i == 0 {
+            out.0 = Some(mean);
+            out.1 = Some(std);
+        } else {
+            out.2 = Some(mean);
+            out.3 = Some(std);
+        }
+    }
+    Ok(out)
+}
 
 /// Total L2 norm of gradients.
 fn grad_norm(grads: &GradStore, vars: &[Var]) -> anyhow::Result<f64> {
