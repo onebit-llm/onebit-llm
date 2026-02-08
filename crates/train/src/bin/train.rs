@@ -1,13 +1,27 @@
 //! CLI for training OneBit-LLM from scratch.
+//!
+//! Uses a prefetch thread to prepare batches while the GPU is busy, and
+//! defaults to larger batch sizes for better GPU/CPU utilization.
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
 
 use candle_core::Device;
 use clap::Parser;
 
 use ternary_common::{AnyBatchDataset, BatchDataset, OneBitLlmConfig, StreamingBatchIter, TextDataset};
 use ternary_train::{LrDecay, Trainer, TrainerConfig};
+
+/// Number of batches to prefetch so the training thread is not starved.
+const PREFETCH_BUFFER: usize = 8;
+
+enum PrefetchMessage {
+    Batch((Vec<u32>, Vec<u32>)),
+    EpochEnd,
+    Done,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "onebit-train", about = "Train a 1-bit LLM from scratch")]
@@ -22,7 +36,8 @@ struct Args {
     output_dir: PathBuf,
     #[arg(long)]
     streaming: bool,
-    #[arg(long, default_value = "8")]
+    /// Batch size per micro-step; larger values improve GPU utilization (e.g. 32–64).
+    #[arg(long, default_value = "32")]
     batch_size: usize,
     #[arg(long, default_value = "10000")]
     max_steps: usize,
@@ -48,7 +63,8 @@ struct Args {
     log_every: usize,
     #[arg(long, default_value = "0")]
     debug_every: usize,
-    #[arg(long, default_value = "1")]
+    /// Gradient accumulation steps; effective batch = batch_size * accumulation_steps.
+    #[arg(long, default_value = "4")]
     accumulation_steps: usize,
     #[arg(long)]
     val_data_dir: Option<PathBuf>,
@@ -190,48 +206,83 @@ fn main() -> anyhow::Result<()> {
             anyhow::bail!("No sequences; need at least seq_len+1 tokens");
         }
 
+        eprintln!(
+            "Prefetch buffer: {} batches (batch_size={}, accumulation_steps={}, effective_batch={})",
+            PREFETCH_BUFFER,
+            args.batch_size,
+            args.accumulation_steps,
+            args.batch_size * args.accumulation_steps
+        );
+
+        // Producer thread owns the dataset and prefetches batches so the GPU is not starved.
+        let max_epochs_producer = if args.max_epochs == 0 {
+            10000
+        } else {
+            args.max_epochs
+        };
+        let (tx, rx) = mpsc::sync_channel::<PrefetchMessage>(PREFETCH_BUFFER);
+        let batch_size = args.batch_size;
+        let producer = thread::spawn(move || {
+            for _ in 0..max_epochs_producer {
+                for batch in dataset.batches(batch_size) {
+                    if tx.send(PrefetchMessage::Batch(batch)).is_err() {
+                        return;
+                    }
+                }
+                if tx.send(PrefetchMessage::EpochEnd).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send(PrefetchMessage::Done);
+        });
+
         let mut epoch = 0u32;
-        loop {
+        let mut acc = Vec::with_capacity(args.accumulation_steps);
+        while let Ok(msg) = rx.recv() {
             if args.max_steps > 0 && trainer.global_step >= args.max_steps {
                 break;
             }
             if args.max_epochs > 0 && (epoch as usize) >= args.max_epochs {
-                eprintln!("Completed {} epochs.", args.max_epochs);
                 break;
             }
-            eprintln!("epoch {epoch} (step {})", trainer.global_step);
-
-            let mut batch_iter = dataset
-                .batches(args.batch_size)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .peekable();
-
-            while batch_iter.peek().is_some() {
-                if args.max_steps > 0 && trainer.global_step >= args.max_steps {
-                    break;
+            match msg {
+                PrefetchMessage::Batch(batch) => {
+                    acc.push(batch);
+                    if acc.len() >= args.accumulation_steps {
+                        let m = trainer.step(&acc)?;
+                        acc.clear();
+                        if args.log_every > 0 && m.step % args.log_every == 0 {
+                            eprintln!(
+                                "step {} epoch {epoch} loss {:.4} lr {:.2e}",
+                                m.step, m.loss, m.lr
+                            );
+                        }
+                        if let Some(gn) = m.grad_norm {
+                            eprintln!("  [debug] grad_norm {gn:.4}");
+                        }
+                        run_eval_and_checkpoint(
+                            &trainer,
+                            &val_dataset,
+                            &mut metrics_file,
+                            &args,
+                        )?;
+                    }
                 }
-                let batches: Vec<_> = batch_iter.by_ref().take(args.accumulation_steps).collect();
-                if batches.is_empty() {
-                    break;
+                PrefetchMessage::EpochEnd => {
+                    epoch += 1;
+                    eprintln!("epoch {epoch} (step {})", trainer.global_step);
                 }
-
-                let m = trainer.step(&batches)?;
-
-                if args.log_every > 0 && m.step % args.log_every == 0 {
-                    eprintln!(
-                        "step {} epoch {epoch} loss {:.4} lr {:.2e}",
-                        m.step, m.loss, m.lr
-                    );
-                }
-                if let Some(gn) = m.grad_norm {
-                    eprintln!("  [debug] grad_norm {gn:.4}");
-                }
-
-                run_eval_and_checkpoint(&trainer, &val_dataset, &mut metrics_file, &args)?;
+                PrefetchMessage::Done => break,
             }
-            epoch += 1;
         }
+        if !acc.is_empty() {
+            let m = trainer.step(&acc)?;
+            if args.log_every > 0 {
+                eprintln!("step {} epoch {epoch} loss {:.4} lr {:.2e}", m.step, m.loss, m.lr);
+            }
+            run_eval_and_checkpoint(&trainer, &val_dataset, &mut metrics_file, &args)?;
+        }
+        let _ = producer.join();
     }
 
     let path = trainer.save_final()?;

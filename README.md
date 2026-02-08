@@ -148,13 +148,14 @@ cargo run -p ternary-train --bin onebit-tokenize -- \
 
 ### 3. Train (mixed-precision: Sandwich Rule by default)
 
+Defaults use **batch_size=32**, **accumulation_steps=4** (effective batch 128) and a **prefetch thread** so the GPU stays fed. On **16 GB VRAM** with the default WikiText config, use `--batch-size 8 --accumulation-steps 4` to avoid OOM; see [Performance report](#performance-report-wikitext-2).
+
 ```bash
 cargo run --release -p ternary-train --bin onebit-train --features cuda -- \
   --config config.json \
   --data-dir ./data/tokenized \
   --tokenizer ./data/tokenizer.json \
   --output-dir ./checkpoints \
-  --batch-size 4 --accumulation-steps 4 \
   --lr 5e-3 --lr-decay cosine --lr-warmup-steps 200 \
   --max-steps 10000 --save-every 1000 --log-every 100
 ```
@@ -345,37 +346,54 @@ For large datasets, avoid loading all tokens into RAM by using a pre-tokenized b
 
 ---
 
-## Experimental results (WikiText-2)
+## Performance report (WikiText-2)
 
-The following describes a real training and inference run on WikiText-2. **This model is not ready for production or general use.** Results are documented for reproducibility and to set accurate expectations.
+Real training and inference runs on WikiText-2. **Models are research-quality only**, not production-ready. Results are for reproducibility and to set expectations.
 
-### Hardware
+### Hardware & throughput
 
-- **GPU:** NVIDIA RTX 4080 (16 GB VRAM)
-- Training and inference were run on this single GPU.
+| Item | Value |
+|------|--------|
+| **GPU** | Single NVIDIA GPU, 16 GB VRAM |
+| **Max batch size** | **8** (batch 32/16 hit CUDA OOM with this config) |
+| **Effective batch** | 32 (batch_size 8 × accumulation_steps 4) |
+| **GPU utilization** | **98–100%** during training |
+| **VRAM usage** | ~13.8 GB / 16.4 GB (~84%) |
+| **Prefetch** | 8 batches; producer thread keeps GPU fed |
 
-### Settings
+With **prefetch + streaming** (no full-epoch `.collect()`), the GPU stays saturated. For larger VRAM, increase `--batch-size`; for less, use `--batch-size 4 --accumulation-steps 4`.
 
-- **Config:** `config_wikitext.json` — binary 1-bit (no ternary), 512 hidden size, 8 layers, 8 heads, 1536 intermediate size, **max_seq_len 256** (reduced from 512 to avoid OOM). RMSNorm, RoPE, QK-norm, residual scaling, and dynamic threshold enabled. `ste_scale_factor` 1.0, `latent_clamp_max` 1.5, `anneal_fraction` 0.2, `arenas_initial` 0.1, `arenas_anneal_steps` 5000.
-- **Data:** WikiText-2 via `scripts/download_wikitext.py` — train ~998 paragraphs (~413K tokens), validation 176 paragraphs; GPT-2 tokenizer (`data/tokenizer.json`).
-- **Training:** AdamW, lr 1e-3, cosine decay to 1e-5, warmup 500 steps, batch_size 2, accumulation_steps 4 (effective batch 8), grad_clip_max_norm 1.0, label_smoothing 0.05. **50,000 steps** with streaming over `data/wikitext-2/`, saving checkpoints every 10K steps and the final model to `checkpoints/wikitext/`.
+### Config & data
 
-### Training results
+- **Config:** `config_wikitext.json` — binary 1-bit, 512 hidden, 8 layers, 8 heads, 1536 intermediate, **max_seq_len 256**. RMSNorm, RoPE, QK-norm, residual scaling, dynamic threshold. `ste_scale_factor` 1, `latent_clamp_max` 1.5, `anneal_fraction` 0.2, `arenas_initial` 0.1, `arenas_anneal_steps` 5000.
+- **Data:** WikiText-2 — ~494K tokens, ~1930 sequences (seq_len 257); GPT-2 tokenizer (`data/tokenizer.json`).
 
-| Step   | Train loss | Val loss | Notes                    |
-|--------|------------|----------|--------------------------|
-| 5,000  | ~11        | —        | Early checkpoint         |
-| 20,000 | ~9.5       | ~26.6    | Mid training             |
-| 50,000 | **8.07**   | **25.15**| Final run (completed)    |
+### Training results (5,000 steps)
 
-Validation perplexity at 50K steps was very high (~8.4e10), indicating the model has not learned to predict text reliably.
+| Step   | Train loss | Notes        |
+|--------|------------|--------------|
+| 0      | 513.98     | Warmup       |
+| 1,000  | 21.34      |              |
+| 2,500  | 10.84      | Checkpoint   |
+| 5,000  | **~9.81**  | Final run    |
 
-### Inference results
+Checkpoints saved at 2,500 and 5,000 steps. Training time ~11 minutes for 5k steps at full GPU utilization.
 
-Generation was tested with `onebit-test-generate` (temperature 0.7, top-k 40, top-p 0.9, repetition penalty 1.4) on prompts such as *"The history of"*, *"The rain fell"*, *"A small boat"*, *"The scientist"*, *"Stars twinkled"*.
+### Generation test (5k checkpoint)
 
-- **Observed behaviour:** The model sometimes produces plausible short beginnings (e.g. *"The history of"*, *"The rain fell"*) and WikiText-style fragments (names, places, numbers), but output quickly degrades into word salad, list-like tokens, and severe repetition (e.g. repeated words or subwords). It has not learned coherent sentence structure or long-range fluency.
-- **Conclusion:** The 1-bit model has captured local token and phrase statistics to some degree but is **not suitable for use** as a language model in its current form. Further work (more/better data, longer training, architecture or inference tuning) would be needed to approach usable quality.
+`onebit-test-generate --model-dir checkpoints/wikitext --prompt "The history of" --max-tokens 80 --temperature 0.8 --top-p 0.9 --repetition-penalty 1.2`:
+
+- **Observed:** Short plausible starts (e.g. *"The history of"*, *"The rain fell"*) then quick decay into repetition, list-like tokens, and word salad. Coherent sentence structure and long-range fluency are not learned at 5k steps.
+- **Conclusion:** The 1-bit model is learning local token statistics; **not suitable as a general LM** without more data, longer training, or architecture changes.
+
+### Older run (50k steps)
+
+| Step   | Train loss | Val loss |
+|--------|------------|----------|
+| 20,000 | ~9.5       | ~26.6    |
+| 50,000 | **8.07**   | **25.15**|
+
+Validation perplexity remains very high; 50k steps still do not yield reliable next-token prediction.
 
 ---
 
