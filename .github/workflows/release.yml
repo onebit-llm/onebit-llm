@@ -35,6 +35,7 @@ jobs:
       - name: Build
         run: |
           if [ "${{ matrix.target }}" == "cuda" ]; then
+            export CUDA_COMPUTE_CAP=80
             cargo build --release --features cuda
           else
             cargo build --release
