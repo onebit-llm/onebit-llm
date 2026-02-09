@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }} - ${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: cpu
+            features: ""
+          - target: cuda
+            features: "cuda"
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install CUDA Toolkit
+        if: matrix.target == 'cuda'
+        run: |
+          wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get -y install cuda-toolkit-12-2
+          echo "CUDA_PATH=/usr/local/cuda-12.2" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/usr/local/cuda-12.2/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          echo "/usr/local/cuda-12.2/bin" >> $GITHUB_PATH
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.target }}" == "cuda" ]; then
+            cargo build --release --features cuda
+          else
+            cargo build --release
+          fi
+
+      - name: Package binaries
+        run: |
+          mkdir out
+          cp target/release/onebit-train out/onebit-train-${{ matrix.target }}
+          cp target/release/onebit-search out/onebit-search-${{ matrix.target }}
+          cp target/release/onebit-chat out/onebit-chat-${{ matrix.target }}
+          cp target/release/onebit-export out/onebit-export-${{ matrix.target }}
+          cp target/release/onebit-test-generate out/onebit-test-generate-${{ matrix.target }}
+          cp target/release/onebit-tokenize out/onebit-tokenize-${{ matrix.target }}
+          cp target/release/onebit-eval-config out/onebit-eval-config-${{ matrix.target }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: out/*
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
