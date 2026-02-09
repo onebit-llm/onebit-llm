@@ -27,10 +27,10 @@ jobs:
 
       - name: Install CUDA Toolkit
         if: matrix.target == 'cuda'
-        uses: Jimver/cuda-toolkit@v0.2.21
+        uses: Jimver/cuda-toolkit@v0.2.30
         with:
           cuda: '12.2.0'
-          method: 'local'
+          method: 'network'
 
       - name: Build
         run: |
