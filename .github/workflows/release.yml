@@ -25,12 +25,17 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install CUDA Toolkit
+      - name: Configure CUDA
         if: matrix.target == 'cuda'
-        uses: Jimver/cuda-toolkit@v0.2.20
-        with:
-          cuda: '12.2.0'
-          method: 'network'
+        run: |
+          if [ -d "/usr/local/cuda" ]; then
+            echo "CUDA_PATH=/usr/local/cuda" >> $GITHUB_ENV
+            echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+            echo "/usr/local/cuda/bin" >> $GITHUB_PATH
+          else
+            echo "CUDA not found in /usr/local/cuda"
+            exit 1
+          fi
 
       - name: Build
         run: |
