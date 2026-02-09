@@ -41,7 +41,7 @@ Ensure you have the Rust toolchain installed. For GPU acceleration, the appropri
 
 ```bash
 # Clone the repository
-git clone https://github.com/anil/onebit-llm
+git clone https://github.com/onebit-llm/onebit-llm
 cd onebit-llm
 
 # Build with CUDA support
