@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     name: Build (${{ matrix.target }} - ${{ matrix.features }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
@@ -31,6 +31,7 @@ jobs:
         with:
           cuda: '12.2.0'
           method: 'network'
+          sub-packages: '["compiler", "nvcc", "library_face"]'
 
       - name: Build
         run: |
@@ -61,7 +62,7 @@ jobs:
   release:
     name: Create Release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
