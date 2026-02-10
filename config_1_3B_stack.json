@@ -1,0 +1,57 @@
+{
+  "vocab_size": 50257,
+  "hidden_size": 2048,
+  "num_heads": 32,
+  "num_layers": 24,
+  "intermediate_size": 5504,
+  "max_seq_len": 2048,
+  "layer_norm_eps": 1e-5,
+
+  "use_ternary": true,
+  "use_relu2": true,
+  "use_swiglu": false,
+  "use_subln": true,
+  "use_rope": true,
+  "use_qk_norm": true,
+  "use_residual_scaling": true,
+  "use_dynamic_threshold": true,
+
+  "ste_scale_factor": 2.0,
+  "latent_clamp_max": 1.5,
+  "latent_clip_max_training": 1.2,
+
+  "anneal_fraction": 0.3,
+  "arenas_initial": null,
+  "arenas_anneal_steps": 20000,
+
+  "layer_bit_map": {
+    "embedding": "f16",
+    "layer_modes": [
+      "f16",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "ternary",
+      "f16"
+    ],
+    "lm_head": "f16"
+  }
+}

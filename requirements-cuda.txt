@@ -1,0 +1,12 @@
+# CUDA 13.0 için önce şunu çalıştırın:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+# Sonra:
+#   pip install -r requirements-cuda.txt
+
+transformers>=4.30
+huggingface-hub>=0.20
+pyarrow>=14
+pandas>=2.0
+tqdm
+python-dotenv
+safetensors

@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e .
+
+      - name: Import and forward
+        run: |
+          python -c "
+          from onebit_llm.config import OneBitLlmConfig
+          from onebit_llm.model import OneBitLlm
+          import torch
+          cfg = OneBitLlmConfig.load('config_0_3B_stack.json')
+          m = OneBitLlm(cfg)
+          x = torch.randint(0, cfg.vocab_size, (1, 64))
+          y = m(x, use_checkpointing=True, segment_size=8)
+          assert y.shape == (1, 64, cfg.vocab_size)
+          print('OK')
+          "

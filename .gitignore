@@ -1,9 +1,7 @@
-# Build
+# Build / checkpoints / exports
 /target/
-**/*.rs.bk
-
-# Checkpoints and exports (large binaries)
 /checkpoints/
+/checkpoints_stack_stream*/
 /exported/
 *.safetensors
 
@@ -33,7 +31,7 @@ Thumbs.db
 # Optional: Cursor project files
 .cursor/
 
-# Python (rewrite)
+# Python
 __pycache__/
 *.py[cod]
 .venv/
