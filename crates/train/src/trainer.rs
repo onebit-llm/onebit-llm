@@ -9,9 +9,9 @@ use candle_core::{backprop::GradStore, DType, Device, Tensor, Var};
 use candle_nn::{loss, ops, AdamW, Optimizer, ParamsAdamW, VarBuilder, VarMap};
 
 use ternary_common::{batch_to_tensors, BatchDataset, OneBitLlmConfig};
-use ternary_core::{compression_stats, OneBitLlm};
+use ternary_core::{compression_stats, set_quant_anneal_frac, OneBitLlm};
 
-use crate::scheduler::{AnnealSchedule, LrDecay, LrScheduler};
+use crate::scheduler::{LrDecay, LrScheduler};
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -35,6 +35,10 @@ pub struct TrainerConfig {
     pub eval_every: usize,
     pub eval_batches: usize,
     pub output_dir: PathBuf,
+    /// QAT warmup steps (Phase 1: no quantisation inside BitLinear).
+    pub quant_warmup_steps: usize,
+    /// QAT annealing steps (Phase 2: soft→hard quant schedule).
+    pub quant_anneal_steps: usize,
 }
 
 /// Metrics returned after each training step.
@@ -61,7 +65,6 @@ pub struct Trainer {
     vars: Vec<Var>,
     optimizer: AdamW,
     lr_scheduler: LrScheduler,
-    anneal_schedule: AnnealSchedule,
     pub config: TrainerConfig,
     model_config: OneBitLlmConfig,
     pub global_step: usize,
@@ -96,9 +99,6 @@ impl Trainer {
             trainer_config.max_steps,
             trainer_config.lr_decay,
         );
-        let anneal_schedule =
-            AnnealSchedule::new(trainer_config.max_steps, model_config.anneal_fraction);
-
         let optimizer = AdamW::new(
             vars.clone(),
             ParamsAdamW {
@@ -114,7 +114,6 @@ impl Trainer {
             vars,
             optimizer,
             lr_scheduler,
-            anneal_schedule,
             config: trainer_config,
             model_config,
             global_step: 0,
@@ -122,11 +121,38 @@ impl Trainer {
         })
     }
 
+    /// Update the global quantisation phase for all BitLinear layers.
+    ///
+    /// Implements Continual QAT:
+    /// - Phase 1 (Warmup): step < quant_warmup_steps       → anneal = 0.0 (BitLinear runs full-precision)
+    /// - Phase 2 (Anneal): warmup .. warmup+anneal_steps   → anneal in (0,1)
+    /// - Phase 3 (Hard):   step >= warmup+anneal_steps     → anneal = 1.0
+    fn update_quant_phase(&self) {
+        let step = self.global_step;
+        let warmup = self.config.quant_warmup_steps;
+        let anneal_steps = self.config.quant_anneal_steps.max(1);
+
+        let frac = if step < warmup {
+            0.0_f32
+        } else if step < warmup + anneal_steps {
+            let s = (step - warmup) as f32 / anneal_steps as f32;
+            s.clamp(0.0, 1.0)
+        } else {
+            1.0_f32
+        };
+
+        set_quant_anneal_frac(frac);
+    }
+
     /// Execute one optimiser step over N accumulated micro-batches.
     pub fn step(&mut self, batches: &[(Vec<u32>, Vec<u32>)]) -> anyhow::Result<StepMetrics> {
         let n = batches.len();
         let seq_len = self.model_config.max_seq_len;
         let batch_size = self.config.batch_size;
+
+        // Update Continual QAT phase *before* any forward pass so all BitLinear
+        // layers see the correct annealing / warmup state.
+        self.update_quant_phase();
 
         // Arenas coefficient
         let arenas_coef = self.model_config.arenas_initial.map(|init| {
@@ -202,7 +228,6 @@ impl Trainer {
         // Advance schedules
         let lr = self.lr_scheduler.current_lr();
         self.lr_scheduler.advance();
-        self.anneal_schedule.step(self.global_step);
         self.global_step += 1;
 
         Ok(StepMetrics {

@@ -180,9 +180,13 @@ impl TernaryLinear {
         let w_use = w.clamp(-self.latent_clamp_max, self.latent_clamp_max)?;
         let in_dim = w_use.dim(1)?;
         let w_ternary = ternary_quantize_forward(&w_use, self.use_dynamic_threshold)?;
-        let gamma = w_use.abs()?.mean_all()?.to_scalar::<f32>()?.max(1e-8) as f64;
-        let scale = gamma / (in_dim as f64).sqrt();
-        self.cache.lock().replace((w_ternary, scale));
+        let gamma = w_use
+            .abs()?
+            .mean_all()?
+            .to_scalar::<f32>()?
+            .max(1e-8) as f64;
+        let scale_w = gamma / (in_dim as f64).sqrt();
+        self.cache.lock().replace((w_ternary, scale_w));
         Ok(())
     }
 
@@ -191,13 +195,55 @@ impl TernaryLinear {
         self.cache.lock().take();
     }
 
+    /// AbsMax activation quantisation (inference, no STE).
+    ///
+    ///   scale_x = max(|x|) / 127.0
+    ///   x_int   = clamp(round(x / scale_x), -127, 127)
+    fn quantize_activation_absmax_inference(&self, x: &Tensor) -> Result<(Tensor, f64)> {
+        let abs_max = x
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?
+            .max(1e-8) as f64;
+        let scale_x = abs_max / 127.0_f64;
+        let x_scaled = x.affine(1.0 / scale_x, 0.0)?;
+        let x_int = x_scaled.round()?.clamp(-127.0_f64, 127.0_f64)?;
+        Ok((x_int, scale_x))
+    }
+
+    /// AbsMax activation quantisation with STE (training).
+    ///
+    ///   scale_x = max(|x|) / 127.0
+    ///   x_int   = clamp(round(x / scale_x), -127, 127)
+    ///   x_q     = x_int.detach() + (x - x.detach()) * ste_scale_factor
+    fn quantize_activation_absmax_ste(&self, x: &Tensor) -> Result<(Tensor, f64)> {
+        let abs_max = x
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?
+            .max(1e-8) as f64;
+        let scale_x = abs_max / 127.0_f64;
+
+        let x_scaled = x.affine(1.0 / scale_x, 0.0)?;
+        let x_int = x_scaled.round()?.clamp(-127.0_f64, 127.0_f64)?;
+
+        let x_detach = x.detach();
+        let residual = (x - &x_detach)?;
+        let x_q = (x_int.detach() + residual.affine(self.ste_scale_factor, 0.0)?)?;
+
+        Ok((x_q, scale_x))
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // Fast path: cached inference weights
         {
             let guard = self.cache.lock();
-            if let Some((ref w_ternary, scale)) = *guard {
-                let out = matmul_reshape(x, &w_ternary.t()?)?;
-                return out.affine(scale, 0.0);
+            if let Some((ref w_ternary, scale_w)) = *guard {
+                // BitNet-style: ternary weights + AbsMax int8 activations.
+                let (x_int, scale_x) = self.quantize_activation_absmax_inference(x)?;
+                let y_int = matmul_reshape(&x_int, &w_ternary.t()?)?;
+                let total_scale = scale_w * scale_x;
+                return y_int.affine(total_scale, 0.0);
             }
         }
 
@@ -207,20 +253,35 @@ impl TernaryLinear {
         let in_dim = w_use.dim(1)?;
         let anneal = current_anneal_frac();
 
-        // Soft activation smoothing during annealing (stabilises early grads).
-        let x_in = if anneal < 1.0 {
-            let alpha = 1.0 + 7.0 * anneal;
-            ste_tanh_scaled(x, alpha, self.ste_scale_factor)?
-        } else {
-            x.clone()
-        };
+        // Continual QAT interpretation of `anneal`:
+        // - 0.0   → Warmup: behave like full-precision Linear (no quant)
+        // - 0.0..1.0 → Quantised training with STE
+        // - 1.0   → Hard QAT (still STE, but global schedule is "locked")
+        if anneal <= 0.0 {
+            // Phase 1: Warmup — standard F32/F16 linear, no quantisation at all.
+            return self.weight.forward(x);
+        }
 
+        // Phase 2 & 3: Quantised training
+        // 1) Ternary weights with STE
         let w_ternary =
             ternary_absmean_ste(&w_use, self.use_dynamic_threshold, self.ste_scale_factor)?;
-        let out = matmul_reshape(&x_in, &w_ternary.t()?)?;
-        let gamma = w_use.abs()?.mean_all()?.to_scalar::<f32>()?.max(1e-8) as f64;
-        let scale = gamma / (in_dim as f64).sqrt();
-        out.affine(scale, 0.0)
+
+        // 2) Compute weight scaling factor (BitNet-style)
+        let gamma = w_use
+            .abs()?
+            .mean_all()?
+            .to_scalar::<f32>()?
+            .max(1e-8) as f64;
+        let scale_w = gamma / (in_dim as f64).sqrt();
+
+        // 3) AbsMax int8 activations with STE
+        let (x_int, scale_x) = self.quantize_activation_absmax_ste(x)?;
+
+        // 4) Integer-domain matmul then dequantise with scale_x * scale_w
+        let y_int = matmul_reshape(&x_int, &w_ternary.t()?)?;
+        let total_scale = scale_w * scale_x;
+        y_int.affine(total_scale, 0.0)
     }
 }
 

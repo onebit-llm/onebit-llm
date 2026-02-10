@@ -72,6 +72,12 @@ struct Args {
     eval_every: usize,
     #[arg(long, default_value = "50")]
     eval_batches: usize,
+    /// QAT warmup steps before enabling any quantisation in BitLinear.
+    #[arg(long, default_value = "2000")]
+    quant_warmup_steps: usize,
+    /// QAT annealing steps (after warmup) to go from soft→hard quantisation.
+    #[arg(long, default_value = "8000")]
+    quant_anneal_steps: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -109,6 +115,8 @@ fn main() -> anyhow::Result<()> {
         eval_every: args.eval_every,
         eval_batches: args.eval_batches,
         output_dir: args.output_dir.clone(),
+        quant_warmup_steps: args.quant_warmup_steps,
+        quant_anneal_steps: args.quant_anneal_steps,
     };
 
     let device = Device::cuda_if_available(0)?;
