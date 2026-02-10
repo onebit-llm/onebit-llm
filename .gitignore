@@ -32,3 +32,11 @@ Thumbs.db
 
 # Optional: Cursor project files
 .cursor/
+
+# Python (rewrite)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+*.egg/
