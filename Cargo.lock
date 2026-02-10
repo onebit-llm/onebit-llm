@@ -1380,6 +1380,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "onebit-cli"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "clap",
+ "rayon",
+ "serde",
+ "serde_json",
+ "ternary-common",
+ "ternary-core",
+ "ternary-infer",
+ "ternary-search",
+ "ternary-train",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "onig"
 version = "6.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

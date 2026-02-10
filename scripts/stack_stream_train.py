@@ -159,8 +159,8 @@ def ensure_shard_downloaded(
         return
     shard_dir.mkdir(parents=True, exist_ok=True)
 
-    # Özel durum: The Stack (bigcode/the-stack) URL formatını Python API ile çöz.
-    # URL şablonu: "bigcode/the-stack:data/<language>/train-....parquet"
+    # Special case: resolve The Stack (bigcode/the-stack) URLs via the Python API.
+    # URL pattern: "bigcode/the-stack:data/<language>/train-....parquet"
     if shard.url.startswith("bigcode/the-stack:") and hf_hub_download is not None:
         repo_id, subpath = shard.url.split(":", 1)
         print(

@@ -37,21 +37,15 @@ jobs:
         run: |
           if [ "${{ matrix.target }}" == "cuda" ]; then
             export CUDA_COMPUTE_CAP=80
-            cargo build --release --features cuda
+            cargo build --release --bin onebit --features cuda
           else
-            cargo build --release
+            cargo build --release --bin onebit
           fi
 
       - name: Package binaries
         run: |
           mkdir out
-          cp target/release/onebit-train out/onebit-train-${{ matrix.target }}
-          cp target/release/onebit-search out/onebit-search-${{ matrix.target }}
-          cp target/release/onebit-chat out/onebit-chat-${{ matrix.target }}
-          cp target/release/onebit-export out/onebit-export-${{ matrix.target }}
-          cp target/release/onebit-test-generate out/onebit-test-generate-${{ matrix.target }}
-          cp target/release/onebit-tokenize out/onebit-tokenize-${{ matrix.target }}
-          cp target/release/onebit-eval-config out/onebit-eval-config-${{ matrix.target }}
+          cp target/release/onebit out/onebit-${{ matrix.target }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

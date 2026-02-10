@@ -47,8 +47,11 @@ Ensure you have the Rust toolchain installed. For GPU acceleration, the appropri
 git clone https://github.com/onebit-llm/onebit-llm
 cd onebit-llm
 
-# Build with CUDA support
-cargo build --release --features cuda
+# Build unified CLI (CPU-only)
+cargo build --release --bin onebit
+
+# Or build with CUDA support
+cargo build --release --bin onebit --features cuda
 ```
 
 ### 2. Prepare Data
@@ -59,10 +62,11 @@ Download and tokenize the WikiText-2 dataset (or use your own raw text files):
 # Download dataset and tokenizer
 python3 scripts/download_wikitext.py
 
-# Tokenize for high-performance training
-cargo run -p ternary-train --bin onebit-tokenize -- \
+# Tokenize for high-performance training (mmap .tokens)
+./target/release/onebit tokenize \
   --data-dir data/wikitext-2 \
   --tokenizer data/tokenizer.json \
+  --seq-len 256 \
   --output data/wikitext-2/train.tokens
 ```
 
@@ -71,7 +75,7 @@ cargo run -p ternary-train --bin onebit-tokenize -- \
 Start training a ternary model with the **Sandwich Rule** enabled:
 
 ```bash
-cargo run --release --features cuda -p ternary-train --bin onebit-train -- \
+./target/release/onebit train \
   --config config_wikitext2_production.json \
   --data-dir data/wikitext-2/train.tokens \
   --tokenizer data/tokenizer.json \
@@ -79,6 +83,22 @@ cargo run --release --features cuda -p ternary-train --bin onebit-train -- \
   --batch-size 8 \
   --accumulation-steps 4 \
   --lr 5e-3
+```
+
+### 4. Inference (chat and batch generation)
+
+After training (or downloading) a model directory containing `config.json`, `model.safetensors`, and `tokenizer.json`:
+
+```bash
+# Interactive chat
+./target/release/onebit chat \
+  --model-dir checkpoints
+
+# Quick generation from a prompt
+./target/release/onebit generate \
+  --model-dir checkpoints \
+  --prompt "The cat sat" \
+  --max-tokens 100
 ```
 
 ---
@@ -119,7 +139,7 @@ For TB-scale datasets like **The Stack** (≈6 TB), the repo provides an orchest
   - Keeps local shard cache under `--disk-budget-gb`.
   - Interleaves languages over time (language-weighted sampling).
   - Downloads each shard to `/media/.../stack_shards/<language>/<id>` via the HF Python API.
-  - Calls `onebit-train --streaming` for a fixed number of steps on each shard.
+  - Calls `onebit train --streaming` for a fixed number of steps on each shard.
 
 Example (8B config, adjust batch size to your GPU):
 
